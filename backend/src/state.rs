@@ -1,25 +1,36 @@
-use std::sync::Arc;
+use crate::models::{AppConfig, Portfolio, WsMessage, DexToken};
 use parking_lot::RwLock;
-use tokio::sync::broadcast;
-use chrono::Utc;
+use std::sync::Arc;
+use tokio::sync::broadcast::{self, Sender};
 
-use crate::models::*;
+pub const DEFAULT_SCAN_QUERIES: &[&str] = &[
+    // Tier 1: narrative-agnostic broad sweep
+    "solana",
+    "solana new",
+    "sol",
+    // Tier 2: current active narratives
+    "solana ai agent",
+    "solana defi",
+    "solana gaming",
+    "solana rwa",
+    "solana pump",
+    // Tier 3: evergreen meme narratives
+    "solana meme",
+    "solana dog cat",
+    "solana pepe frog",
+];
 
 pub struct AppState {
-    pub config:      AppConfig,
-    pub http:        reqwest::Client,
-    pub portfolio:   RwLock<Portfolio>,
-    pub tokens:      RwLock<std::collections::HashMap<String, ScoredToken>>,
-    pub whales:      RwLock<Vec<WhaleActivity>>,
-    pub scan_filter: RwLock<ScanFilter>,   // ← live filter from frontend
-    pub tx:          broadcast::Sender<WsMessage>,
+    pub config: AppConfig,
+    pub portfolio: RwLock<Portfolio>,
+    pub scanner_tokens: RwLock<Vec<DexToken>>,
+    pub scan_queries: RwLock<Vec<String>>,
+    tx: Sender<WsMessage>,
 }
 
 impl AppState {
     pub fn new(config: AppConfig) -> Arc<Self> {
-        let (tx, _) = broadcast::channel(512);
-
-        let portfolio = Portfolio {
+        let initial = Portfolio {
             total_capital_usd:  config.initial_capital_usd,
             available_cash_usd: config.initial_capital_usd,
             invested_usd:       0.0,
@@ -31,38 +42,24 @@ impl AppState {
             win_rate_pct:       0.0,
             positions:          Vec::new(),
             recent_trades:      Vec::new(),
-            updated_at:         Utc::now(),
+            updated_at:         chrono::Utc::now(),
+            is_paper_trade:     config.dry_run,
         };
-
-        // Seed filter from .env values if set, else use defaults
-        let scan_filter = ScanFilter {
-            min_liquidity: config.min_liquidity_usd,
-            min_volume:    config.min_volume_24h,
-            max_age_hours: config.max_age_hours,
-            min_score:     config.min_score,
-            ..ScanFilter::default()
-        };
-
+        let (tx, _rx) = broadcast::channel(128);
         Arc::new(Self {
-            http: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(15))
-                .user_agent("SolanaSniper/1.0")
-                .build()
-                .expect("HTTP client init failed"),
-            portfolio:   RwLock::new(portfolio),
-            tokens:      RwLock::new(std::collections::HashMap::new()),
-            whales:      RwLock::new(Vec::new()),
-            scan_filter: RwLock::new(scan_filter),
             config,
+            portfolio:      RwLock::new(initial),
+            scanner_tokens: RwLock::new(Vec::new()),
+            scan_queries:   RwLock::new(DEFAULT_SCAN_QUERIES.iter().map(|s| s.to_string()).collect()),
             tx,
         })
     }
 
-    pub async fn broadcast(&self, msg: WsMessage) {
-        let _ = self.tx.send(msg);
-    }
-
     pub fn subscribe(&self) -> broadcast::Receiver<WsMessage> {
         self.tx.subscribe()
+    }
+
+    pub async fn broadcast(&self, msg: WsMessage) {
+        let _ = self.tx.send(msg);
     }
 }

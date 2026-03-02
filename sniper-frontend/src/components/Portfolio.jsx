@@ -1,8 +1,6 @@
 import { useState, useEffect } from 'react'
 import { useWallet } from '@solana/wallet-adapter-react'
 import { useWalletTrading } from '../hooks/useWalletTrading.js'
-import { useConnection } from '@solana/wallet-adapter-react'
-import { PublicKey, LAMPORTS_PER_SOL } from '@solana/web3.js'
 
 const pnlColor = v => parseFloat(v) >= 0 ? '#00ff88' : '#ff4466'
 const fmtUsd   = v => `$${parseFloat(v||0).toFixed(2)}`
@@ -10,32 +8,24 @@ const fmtPrice = v => parseFloat(v||0) < 0.001
   ? `$${parseFloat(v||0).toExponential(3)}`
   : `$${parseFloat(v||0).toFixed(6)}`
 
-// Stored in-memory per session
-let _positions = []
-let _trades    = []
-
-export function Portfolio({ onAlert, externalPositions = [], externalTrades = [] }) {
-  const { connected, publicKey }  = useWallet()
-  const { connection }            = useConnection()
+export function Portfolio({
+  onAlert,
+  portfolio      = null,
+  externalPositions = [],
+  externalTrades    = [],
+  walletCapital  = null,   // { sol, usdc } from App.jsx when wallet connected
+  isPaperMode    = true,
+}) {
+  const { connected }                           = useWallet()
   const { sellToken, getTokenBalance, loading } = useWalletTrading()
-  const [positions, setPositions] = useState([])
-  const [trades,    setTrades]    = useState([])
-  const [solBal,    setSolBal]    = useState(null)
-  const [sellStatus, setSellStatus] = useState({})
-  const [pnlChart,  setPnlChart]  = useState([])
+  const [positions,   setPositions]   = useState([])
+  const [trades,      setTrades]      = useState([])
+  const [sellStatus,  setSellStatus]  = useState({})
 
   useEffect(() => {
     if (externalPositions.length) setPositions(externalPositions)
     if (externalTrades.length)    setTrades(externalTrades)
   }, [externalPositions, externalTrades])
-
-  useEffect(() => {
-    if (!publicKey) return
-    connection.getBalance(publicKey).then(b => setSolBal(b / LAMPORTS_PER_SOL))
-    const iv = setInterval(() =>
-      connection.getBalance(publicKey).then(b => setSolBal(b / LAMPORTS_PER_SOL)), 20000)
-    return () => clearInterval(iv)
-  }, [publicKey, connection])
 
   const handleSell = async (pos, pct = 1.0) => {
     if (!connected) { onAlert('WARNING', 'Connect wallet to sell'); return }
@@ -84,13 +74,71 @@ export function Portfolio({ onAlert, externalPositions = [], externalTrades = []
   const winCount = trades.filter(t=>t.trade_type==='Sell' && (t.pnl||0)>0).length
   const losCount = trades.filter(t=>t.trade_type==='Sell' && (t.pnl||0)<0).length
 
+
   return (
     <div>
+      {/* ── PORTFOLIO SUMMARY ── */}
+      <div style={{ ...card, border:'1px solid rgba(0,220,180,0.3)', marginBottom:12, background:'rgba(0,220,180,0.02)' }}>
+        <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:12 }}>
+          <span style={{ color:'#00dcb4', letterSpacing:2, fontSize:11, fontWeight:700 }}>📊 PORTFOLIO SUMMARY</span>
+          {isPaperMode && (
+            <span style={{ color:'#ffd700', fontSize:9, letterSpacing:1, background:'rgba(255,215,0,0.08)',
+              border:'1px solid rgba(255,215,0,0.3)', borderRadius:3, padding:'2px 8px' }}>
+              📄 PAPER
+            </span>
+          )}
+        </div>
+        <div style={{ display:'grid', gridTemplateColumns:'repeat(auto-fit, minmax(140px, 1fr))', gap:10 }}>
+          {/* When wallet connected: show actual wallet capital */}
+          {walletCapital ? (
+            <div style={{ ...statItem, border:'1px solid rgba(0,220,180,0.2)' }}>
+              <div style={{ color:'#2a5a6a', fontSize:9, letterSpacing:0.5 }}>WALLET CAPITAL</div>
+              <div style={{ color:'#00dcb4', fontSize:12, fontWeight:700 }}>
+                {walletCapital.sol !== null ? `${walletCapital.sol.toFixed(4)} ◎` : '…'}
+              </div>
+              <div style={{ color:'#1a3a4a', fontSize:8, marginTop:2 }}>
+                {walletCapital.usdc !== null ? `+ $${walletCapital.usdc.toFixed(2)} USDC` : 'live balance'}
+              </div>
+            </div>
+          ) : (
+            <div style={statItem}>
+              <div style={{ color:'#2a5a6a', fontSize:9, letterSpacing:0.5 }}>PAPER CAPITAL</div>
+              <div style={{ color:'#c8d8e8', fontSize:12, fontWeight:700 }}>
+                {fmtUsd(portfolio?.total_capital_usd ?? 100.0)}
+              </div>
+              <div style={{ color:'#1a3a4a', fontSize:8, marginTop:2 }}>Virtual</div>
+            </div>
+          )}
+          <div style={statItem}>
+            <div style={{ color:'#2a5a6a', fontSize:9, letterSpacing:0.5 }}>AVAILABLE CASH</div>
+            <div style={{ color:'#00dcb4', fontSize:12, fontWeight:700 }}>
+              {portfolio?.available_cash_usd !== undefined ? fmtUsd(portfolio.available_cash_usd) : '…'}
+            </div>
+            <div style={{ color:'#1a3a4a', fontSize:8, marginTop:2 }}>Not deployed</div>
+          </div>
+          <div style={statItem}>
+            <div style={{ color:'#2a5a6a', fontSize:9, letterSpacing:0.5 }}>INVESTED</div>
+            <div style={{ color:'#ffd700', fontSize:12, fontWeight:700 }}>
+              {portfolio?.invested_usd !== undefined ? fmtUsd(portfolio.invested_usd) : fmtUsd(positions.reduce((s,p)=>s+p.invested_usd,0))}
+            </div>
+            <div style={{ color:'#1a3a4a', fontSize:8, marginTop:2 }}>Open positions</div>
+          </div>
+          <div style={statItem}>
+            <div style={{ color:'#2a5a6a', fontSize:9, letterSpacing:0.5 }}>REALIZED PnL</div>
+            <div style={{ color: (portfolio?.realized_pnl ?? realized)>=0?'#00ff88':'#ff4466', fontSize:12, fontWeight:700 }}>
+              {`${(portfolio?.realized_pnl ?? realized)>=0?'+':''}${fmtUsd(portfolio?.realized_pnl ?? realized)}`}
+            </div>
+            <div style={{ color:'#1a3a4a', fontSize:8, marginTop:2 }}>Closed trades</div>
+          </div>
+        </div>
+      </div>
+
       {/* ── Wallet summary ── */}
       {connected && (
         <div style={{ ...card, border:'1px solid rgba(0,220,180,0.2)', marginBottom:10 }}>
           <div style={{ display:'flex', gap:10, flexWrap:'wrap' }}>
-            <StatMini label="WALLET SOL" value={solBal !== null ? `${solBal.toFixed(4)} ◎` : '…'} color="#00dcb4" />
+            <StatMini label="WALLET SOL"  value={walletCapital?.sol  != null ? `${walletCapital.sol.toFixed(4)} ◎`  : '…'} color="#00dcb4" />
+            <StatMini label="WALLET USDC" value={walletCapital?.usdc != null ? `$${walletCapital.usdc.toFixed(2)}` : '…'} color="#a0c4ff" />
             <StatMini label="REALIZED PnL" value={`${realized>=0?'+':''}${fmtUsd(realized)}`} color={pnlColor(realized)} />
             <StatMini label="WIN/LOSS" value={`${winCount}W / ${losCount}L`} color="#ffd700" />
             <StatMini label="WIN RATE" value={winCount+losCount>0?`${(winCount/(winCount+losCount)*100).toFixed(0)}%`:'—'} color="#a0c4ff" />

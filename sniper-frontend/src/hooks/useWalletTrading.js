@@ -165,6 +165,7 @@ export function useWalletTrading() {
           prioritizationFeeLamports: priorityFee,
         }),
       })
+      if (!swapResp.ok) throw new Error(`Jupiter swap build failed: ${swapResp.status}`)
       const { swapTransaction } = await swapResp.json()
 
       onStatus?.('Approve in wallet…')
@@ -217,6 +218,7 @@ export function useWalletTrading() {
           prioritizationFeeLamports: priorityFee,
         }),
       })
+      if (!swapResp.ok) throw new Error(`Jupiter swap build failed: ${swapResp.status}`)
       const { swapTransaction } = await swapResp.json()
 
       onStatus?.('Approve in wallet…')

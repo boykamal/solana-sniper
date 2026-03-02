@@ -5,6 +5,7 @@ const call = async (path, opts = {}) => {
     headers: { 'Content-Type': 'application/json', ...opts.headers },
     ...opts,
   })
+  if (!r.ok) throw new Error(`API error: ${r.status}`)
   return r.json()
 }
 
@@ -33,6 +34,12 @@ export const api = {
     }),
 
   health: () => call('/health'),
+
+  scanQueries: () => call('/api/scan-queries'),
+  saveScanQueries: (queries) => call('/api/scan-queries', {
+    method: 'POST',
+    body: JSON.stringify({ queries }),
+  }),
 }
 
 // DexScreener direct (no proxy needed)

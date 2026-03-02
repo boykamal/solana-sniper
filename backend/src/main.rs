@@ -1,8 +1,8 @@
 mod models;
 mod state;
 mod scanner;
-mod executor;
 mod risk;
+mod auto_trader;
 mod api;
 
 use std::net::SocketAddr;
@@ -15,20 +15,20 @@ use state::AppState;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // ── LOGGING ───────────────────────────────────────────────────────────────
+    dotenv::dotenv().ok();
+
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::new(
             std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into())
         ))
-        .with(tracing_subscriber::fmt::layer().with_target(false))
+        .with(tracing_subscriber::fmt::layer().with_target(false).without_time())
         .init();
 
     info!("╔═══════════════════════════════════════╗");
-    info!("║       SOLANA SNIPER v1.0.0            ║");
+    info!("║      SODAGAR SNIPER v1.0.0            ║");
     info!("║   Rust + Jupiter + Raydium + Pump     ║");
     info!("╚═══════════════════════════════════════╝");
 
-    // ── CONFIG ─────────────────────────────────────────────────────────────────
     let config = AppConfig::from_env()?;
 
     if config.dry_run {
@@ -43,36 +43,21 @@ async fn main() -> Result<()> {
     info!("🛑 Stop loss: {:.0}%", config.stop_loss_pct * 100.0);
     info!("🔢 Max open positions: {}", config.max_open_positions);
 
-    // ── STATE ─────────────────────────────────────────────────────────────────
     let state = AppState::new(config);
 
-    // ── BACKGROUND TASKS ──────────────────────────────────────────────────────
-
-    // Scanner: poll DexScreener every 30s
-    let scanner_state = state.clone();
-    tokio::spawn(async move {
-        scanner::start_scanner(scanner_state).await;
-    });
-
-    // Risk monitor: check TP/SL every 10s
+    let scan_state = state.clone();
+    tokio::spawn(async move { scanner::start_scanner(scan_state).await; });
     let risk_state = state.clone();
-    tokio::spawn(async move {
-        risk::start_risk_monitor(risk_state).await;
-    });
+    tokio::spawn(async move { risk::start_risk_monitor(risk_state).await; });
+    let auto_state = state.clone();
+    tokio::spawn(async move { auto_trader::start_auto_trader(auto_state).await; });
 
-    // ── HTTP / WS SERVER ──────────────────────────────────────────────────────
-    let port: u16 = std::env::var("PORT")
-        .unwrap_or_else(|_| "8080".into())
-        .parse()?;
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
-
+    let port: u16 = std::env::var("PORT").unwrap_or_else(|_| "8080".into()).parse()?;
+    let addr = SocketAddr::from(([0,0,0,0], port));
     let router = api::build_router(state);
-
     info!("🚀 Server listening on http://0.0.0.0:{}", port);
     info!("📡 WebSocket: ws://0.0.0.0:{}/ws", port);
-
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, router).await?;
-
     Ok(())
 }

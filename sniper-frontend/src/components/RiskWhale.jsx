@@ -15,7 +15,7 @@ export function WhaleTracker({ onAlert }) {
   const [activity,  setActivity]  = useState([])
 
   const addWallet = () => {
-    if (!newWallet.trim() || newWallet.length < 30) {
+    if (!newWallet.trim() || newWallet.trim().length < 32 || newWallet.trim().length > 44) {
       onAlert?.('WARNING', 'Enter a valid Solana address')
       return
     }

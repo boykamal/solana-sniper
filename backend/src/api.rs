@@ -1,267 +1,122 @@
 use std::sync::Arc;
 use axum::{
     Router,
-    routing::{get, post, delete},
-    extract::{State, Path, Query, WebSocketUpgrade},
-    response::{IntoResponse, Response},
+    routing::get,
+    extract::{ws::{WebSocketUpgrade, WebSocket, Message}, State},
+    response::IntoResponse,
     Json,
-    http::StatusCode,
 };
-use axum::extract::ws::{WebSocket, Message};
+use serde_json::json;
 use tower_http::cors::{CorsLayer, Any};
-use serde::Deserialize;
-use tracing::{info, warn};
-use uuid::Uuid;
 
-use crate::models::*;
 use crate::state::AppState;
-use crate::executor::TradeExecutor;
-use crate::risk::{open_position, send_telegram};
-use crate::scanner::calc_position_size;
-
-// ─── ROUTER ──────────────────────────────────────────────────────────────────
+use crate::models::WsMessage;
+use tracing::info;
 
 pub fn build_router(state: Arc<AppState>) -> Router {
+    let cors = CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods(Any)
+        .allow_headers(Any);
+
     Router::new()
-        // Tokens
-        .route("/api/tokens",                get(list_tokens))
-        .route("/api/tokens/:pair",          get(get_token))
-        // Portfolio
-        .route("/api/portfolio",             get(get_portfolio))
-        // Trades
-        .route("/api/trade/buy",             post(execute_buy))
-        .route("/api/trade/sell/:position_id", post(execute_sell))
-        .route("/api/positions/:id/close",   delete(close_position))
-        // Whales
-        .route("/api/whales",                get(get_whales))
-        // Config
-        .route("/api/config",                get(get_config))
-        // Scan filter
-        .route("/api/scan-filter",           get(get_scan_filter))
-        .route("/api/scan-filter",           post(update_scan_filter))
-        // Health
-        .route("/health",                    get(health))
-        // WebSocket
-        .route("/ws",                        get(ws_handler))
-        .layer(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods(Any)
-                .allow_headers(Any)
-        )
+        .route("/health",          get(health))
+        .route("/ws",              get(ws_handler))
+        .route("/api/portfolio",   get(portfolio_handler))
+        .route("/api/tokens",      get(tokens_handler))
+        .route("/api/config",      get(config_handler))
+        .route("/api/scan-filter",  get(scan_filter_get).post(scan_filter_post))
+        .route("/api/scan-queries", get(scan_queries_get).post(scan_queries_post))
+
+        .layer(cors)
         .with_state(state)
 }
 
-// ─── HANDLERS ─────────────────────────────────────────────────────────────────
+// ── Health ────────────────────────────────────────────────────────────────────
 
-#[derive(Deserialize)]
-struct TokensQuery {
-    min_score:  Option<u8>,
-    risk_level: Option<String>,
-    limit:      Option<usize>,
-}
+async fn health() -> &'static str { "ok" }
 
-async fn list_tokens(
+// ── Portfolio ─────────────────────────────────────────────────────────────────
+
+async fn portfolio_handler(
     State(state): State<Arc<AppState>>,
-    Query(q): Query<TokensQuery>,
-) -> Json<ApiResponse<Vec<ScoredToken>>> {
-    let tokens = state.tokens.read();
-    let mut result: Vec<ScoredToken> = tokens.values()
-        .filter(|t| {
-            let score_ok = t.score >= q.min_score.unwrap_or(0);
-            let risk_ok  = q.risk_level.as_ref().map_or(true, |r| {
-                format!("{:?}", t.risk_level).to_uppercase() == r.to_uppercase()
-            });
-            score_ok && risk_ok
-        })
-        .cloned()
-        .collect();
-    result.sort_by(|a, b| b.score.cmp(&a.score));
-    result.truncate(q.limit.unwrap_or(50));
-    Json(ApiResponse::ok(result))
-}
-
-async fn get_token(
-    State(state): State<Arc<AppState>>,
-    Path(pair): Path<String>,
 ) -> impl IntoResponse {
-    let tokens = state.tokens.read();
-    match tokens.get(&pair) {
-        Some(t) => Json(ApiResponse::ok(t.clone())).into_response(),
-        None    => (StatusCode::NOT_FOUND, Json(ApiResponse::<()>::err("Token not found"))).into_response(),
-    }
+    let port = state.portfolio.read().clone();
+    Json(json!({ "data": port }))
 }
 
-async fn get_portfolio(
+// ── Tokens (scanner results) ──────────────────────────────────────────────────
+
+async fn tokens_handler(
     State(state): State<Arc<AppState>>,
-) -> Json<ApiResponse<Portfolio>> {
-    Json(ApiResponse::ok(state.portfolio.read().clone()))
-}
-
-#[derive(Deserialize)]
-struct BuyRequest {
-    pair_address: String,
-    usd_amount:   Option<f64>, // if None, uses auto-sizing
-}
-
-async fn execute_buy(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<BuyRequest>,
 ) -> impl IntoResponse {
-    // Check position limits
-    let (position_count, available_cash) = {
-        let p = state.portfolio.read();
-        (p.positions.len(), p.available_cash_usd)
-    };
+    let tokens = state.scanner_tokens.read().clone();
+    Json(json!({ "data": tokens }))
+}
 
-    if position_count >= state.config.max_open_positions {
-        return (StatusCode::BAD_REQUEST,
-                Json(ApiResponse::<()>::err("Max open positions reached"))).into_response();
-    }
+// ── Config ────────────────────────────────────────────────────────────────────
 
-    // Find token
-    let token = {
-        let tokens = state.tokens.read();
-        tokens.get(&req.pair_address).cloned()
-    };
-
-    let token = match token {
-        Some(t) => t,
-        None => {
-            // Try fetching from DexScreener directly
-            let url = format!("https://api.dexscreener.com/latest/dex/pairs/solana/{}", req.pair_address);
-            match state.http.get(&url).send().await {
-                Ok(r) => match r.json::<serde_json::Value>().await {
-                    Ok(_data) => {
-                        // Parse and score on-the-fly
-                        return (StatusCode::NOT_FOUND,
-                                Json(ApiResponse::<()>::err("Token not in scanner, fetching... retry in 30s"))).into_response();
-                    }
-                    Err(_) => return (StatusCode::NOT_FOUND,
-                                      Json(ApiResponse::<()>::err("Token not found"))).into_response(),
-                },
-                Err(_) => return (StatusCode::NOT_FOUND,
-                                   Json(ApiResponse::<()>::err("Token not found"))).into_response(),
-            }
+async fn config_handler(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    Json(json!({
+        "data": {
+            "dry_run":                state.config.dry_run,
+            "auto_trading_enabled":   state.config.auto_trading_enabled,
+            "initial_capital_usd":    state.config.initial_capital_usd,
+            "auto_buy_min_score":     state.config.auto_buy_min_score,
+            "auto_buy_pct_capital":   state.config.auto_buy_pct_capital,
+            "max_open_positions":     state.config.max_open_positions,
+            "stop_loss_pct":          state.config.stop_loss_pct,
+            "max_position_pct":       state.config.max_position_pct,
         }
-    };
-
-    // Check minimum score
-    if token.score < state.config.min_score {
-        return (StatusCode::BAD_REQUEST,
-                Json(ApiResponse::<()>::err(format!("Token score {} below minimum {}", 
-                                                     token.score, state.config.min_score)))).into_response();
-    }
-
-    let usd = req.usd_amount.unwrap_or_else(|| {
-        calc_position_size(token.score, available_cash, &state.config)
-    });
-
-    if usd > available_cash {
-        return (StatusCode::BAD_REQUEST,
-                Json(ApiResponse::<()>::err("Insufficient cash"))).into_response();
-    }
-
-    let executor = TradeExecutor::new(state.clone());
-    match executor.buy(&token, usd).await {
-        Ok(trade) => {
-            let position = open_position(&state, &token, &trade).await;
-            send_telegram(&state, &format!(
-                "⚡ BUY: {} @ ${:.8}\nSize: ${:.2} | Score: {}\nTx: {}",
-                trade.symbol, trade.price, trade.usd_value, token.score,
-                trade.tx_signature.as_deref().unwrap_or("N/A")
-            )).await;
-            state.broadcast(WsMessage::TradeExecuted(trade.clone())).await;
-            info!("✅ BUY API: {} ${:.2}", trade.symbol, trade.usd_value);
-            Json(ApiResponse::ok(serde_json::json!({
-                "trade": trade,
-                "position": position,
-            }))).into_response()
-        }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR,
-                   Json(ApiResponse::<()>::err(e.to_string()))).into_response(),
-    }
+    }))
 }
 
-#[derive(Deserialize)]
-struct SellRequest {
-    sell_pct: Option<f64>, // 0.0 - 1.0, defaults to 1.0
+// ── Scan filter (stub — filters applied in frontend scanner) ──────────────────
+
+async fn scan_filter_get() -> impl IntoResponse {
+    Json(json!({ "data": null }))
 }
 
-async fn execute_sell(
-    State(state): State<Arc<AppState>>,
-    Path(position_id): Path<Uuid>,
-    Json(req): Json<SellRequest>,
+async fn scan_filter_post(
+    Json(_body): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    let position = {
-        let p = state.portfolio.read();
-        p.positions.iter().find(|p| p.id == position_id).cloned()
-    };
-
-    let position = match position {
-        Some(p) => p,
-        None => return (StatusCode::NOT_FOUND,
-                        Json(ApiResponse::<()>::err("Position not found"))).into_response(),
-    };
-
-    let sell_pct = req.sell_pct.unwrap_or(1.0).clamp(0.01, 1.0);
-    let executor = TradeExecutor::new(state.clone());
-
-    match executor.sell(&position, sell_pct).await {
-        Ok(trade) => {
-            info!("✅ SELL API: {} {:.0}%", position.symbol, sell_pct * 100.0);
-            Json(ApiResponse::ok(trade)).into_response()
-        }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR,
-                   Json(ApiResponse::<()>::err(e.to_string()))).into_response(),
-    }
+    Json(json!({ "ok": true }))
 }
 
-async fn close_position(
+// ── Scan queries — readable/writable from the frontend ────────────────────────
+
+async fn scan_queries_get(
     State(state): State<Arc<AppState>>,
-    Path(id): Path<Uuid>,
 ) -> impl IntoResponse {
-    execute_sell(
-        State(state),
-        Path(id),
-        Json(SellRequest { sell_pct: Some(1.0) }),
-    ).await
+    let queries = state.scan_queries.read().clone();
+    Json(json!({ "data": queries }))
 }
 
-async fn get_whales(
+async fn scan_queries_post(
     State(state): State<Arc<AppState>>,
-) -> Json<ApiResponse<Vec<WhaleActivity>>> {
-    Json(ApiResponse::ok(state.whales.read().clone()))
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    if let Some(arr) = body.get("queries").and_then(|v| v.as_array()) {
+        let queries: Vec<String> = arr.iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .filter(|s| !s.trim().is_empty())
+            .collect();
+        if !queries.is_empty() {
+            *state.scan_queries.write() = queries;
+            info!("📝 Scan queries updated via API");
+        }
+    }
+    Json(json!({ "ok": true }))
 }
 
-async fn get_config(
-    State(state): State<Arc<AppState>>,
-) -> Json<ApiResponse<serde_json::Value>> {
-    let c = &state.config;
-    Json(ApiResponse::ok(serde_json::json!({
-        "dry_run":              c.dry_run,
-        "initial_capital_usd": c.initial_capital_usd,
-        "max_position_pct":    c.max_position_pct,
-        "stop_loss_pct":       c.stop_loss_pct,
-        "min_liquidity_usd":   c.min_liquidity_usd,
-        "min_volume_24h":      c.min_volume_24h,
-        "max_age_hours":       c.max_age_hours,
-        "min_score":           c.min_score,
-        "max_open_positions":  c.max_open_positions,
-        "slippage_bps":        c.slippage_bps,
-    })))
-}
-
-async fn health() -> Json<serde_json::Value> {
-    Json(serde_json::json!({ "status": "ok", "version": "1.0.0" }))
-}
-
-// ─── WEBSOCKET ────────────────────────────────────────────────────────────────
+// ── WebSocket ─────────────────────────────────────────────────────────────────
 
 async fn ws_handler(
-    ws: WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
-) -> Response {
+    ws: WebSocketUpgrade,
+) -> impl IntoResponse {
     ws.on_upgrade(|socket| handle_ws(socket, state))
 }
 
@@ -269,47 +124,22 @@ async fn handle_ws(mut socket: WebSocket, state: Arc<AppState>) {
     info!("🔌 WS client connected");
     let mut rx = state.subscribe();
 
-    // Send initial state
+    // Push current portfolio snapshot immediately on connect
     {
-        let portfolio = state.portfolio.read().clone();
-        let msg = serde_json::to_string(&WsMessage::PortfolioUpdate(portfolio)).unwrap_or_default();
-        if socket.send(Message::Text(msg)).await.is_err() { return; }
-    }
-
-    loop {
-        match rx.recv().await {
-            Ok(ws_msg) => {
-                let json = match serde_json::to_string(&ws_msg) {
-                    Ok(s) => s,
-                    Err(_) => continue,
-                };
-                if socket.send(Message::Text(json)).await.is_err() {
-                    break;
-                }
-            }
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                warn!("WS client lagged {} messages", n);
-            }
-            Err(_) => break,
+        let port = state.portfolio.read().clone();
+        let msg  = serde_json::to_string(&WsMessage::PortfolioUpdate(port)).unwrap_or_default();
+        if socket.send(Message::Text(msg)).await.is_err() {
+            return;
         }
     }
-    info!("🔌 WS client disconnected");
-}
 
-// ─── SCAN FILTER ──────────────────────────────────────────────────────────────
-
-async fn get_scan_filter(
-    State(state): State<Arc<AppState>>,
-) -> Json<ApiResponse<ScanFilter>> {
-    Json(ApiResponse::ok(state.scan_filter.read().clone()))
-}
-
-async fn update_scan_filter(
-    State(state): State<Arc<AppState>>,
-    Json(new_filter): Json<ScanFilter>,
-) -> Json<ApiResponse<ScanFilter>> {
-    info!("⚙ Scan filter updated: liq≥{} vol≥{} score≥{}",
-        new_filter.min_liquidity, new_filter.min_volume, new_filter.min_score);
-    *state.scan_filter.write() = new_filter.clone();
-    Json(ApiResponse::ok(new_filter))
+    while let Ok(ws_msg) = rx.recv().await {
+        let json = match serde_json::to_string(&ws_msg) {
+            Ok(s)  => s,
+            Err(_) => continue,
+        };
+        if socket.send(Message::Text(json)).await.is_err() {
+            break;
+        }
+    }
 }

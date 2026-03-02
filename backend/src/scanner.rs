@@ -1,285 +1,212 @@
 use std::sync::Arc;
-use anyhow::Result;
-use chrono::Utc;
 use tokio::time::{sleep, Duration};
 use tracing::{info, warn};
+use serde::Deserialize;
 
-use crate::models::*;
+use crate::models::DexToken;
 use crate::state::AppState;
 
-const DEX: &str = "https://api.dexscreener.com";
-const BLACKLIST: &[&str] = &["SCAM","RUG","HONEYPOT","TEST","FAKE"];
+// ── DexScreener API response types ───────────────────────────────────────────
 
-// ─── SCANNER LOOP ─────────────────────────────────────────────────────────────
+#[derive(Debug, Deserialize)]
+struct DexResponse {
+    pairs: Option<Vec<DexPair>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DexPair {
+    chain_id: String,
+    pair_address: String,
+    base_token: DexBaseToken,
+    price_usd: Option<String>,
+    liquidity: Option<DexLiquidity>,
+    volume: Option<DexVolume>,
+    price_change: Option<DexPriceChange>,
+    txns: Option<DexTxns>,
+    pair_created_at: Option<u64>,
+    market_cap: Option<f64>,
+    url: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DexBaseToken {
+    address: String,
+    symbol: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DexLiquidity { usd: Option<f64> }
+
+#[derive(Debug, Deserialize)]
+struct DexVolume { h24: Option<f64> }
+
+#[derive(Debug, Deserialize)]
+struct DexPriceChange {
+    h1: Option<f64>,
+    h24: Option<f64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DexTxns { h1: Option<DexTxnCount> }
+
+#[derive(Debug, Deserialize)]
+struct DexTxnCount {
+    buys: Option<u64>,
+    sells: Option<u64>,
+}
+
+// ── Scoring ───────────────────────────────────────────────────────────────────
+
+fn score_token(liq: f64, vol: f64, h1: f64, buys: u64, sells: u64, age_h: f64, mc: f64) -> u8 {
+    let mut s: i32 = 0;
+
+    if      liq > 500_000.0 { s += 25 }
+    else if liq > 200_000.0 { s += 18 }
+    else if liq > 100_000.0 { s += 12 }
+    else if liq >  50_000.0 { s +=  7 }
+    else if liq >  30_000.0 { s +=  3 }
+    else                    { s -= 15 }
+
+    if      vol > 1_000_000.0 { s += 20 }
+    else if vol >   500_000.0 { s += 15 }
+    else if vol >   100_000.0 { s += 10 }
+    else if vol >    50_000.0 { s +=  5 }
+    else if vol >    10_000.0 { s +=  2 }
+    else                      { s -=  5 }
+
+    if      h1 >  5.0 && h1 <  50.0 { s += 15 }
+    else if h1 >  2.0 && h1 < 100.0 { s +=  8 }
+    else if h1 >  0.0               { s +=  3 }
+    else if h1 < -40.0              { s -= 20 }
+    else if h1 < -20.0              { s -= 10 }
+
+    let ratio = if sells > 0 { buys as f64 / sells as f64 } else { 2.0 };
+    if      ratio > 3.0 { s += 18 }
+    else if ratio > 2.0 { s += 12 }
+    else if ratio > 1.5 { s +=  7 }
+    else if ratio < 0.5 { s -= 15 }
+    else if ratio < 0.8 { s -=  8 }
+
+    if      age_h <  0.5 { s -= 30 }
+    else if age_h <  1.0 { s -= 15 }
+    else if age_h <  3.0 { s -=  5 }
+    else if age_h < 72.0 { s +=  8 }
+
+    if liq > 0.0 && mc > 0.0 && liq / mc < 0.01 { s -= 20 }
+
+    s.max(0).min(100) as u8
+}
+
+fn risk_of(score: u8) -> &'static str {
+    if score >= 70 { "SAFE" } else if score >= 45 { "MODERATE" } else { "DEGEN" }
+}
+
+// ── Scanner loop ──────────────────────────────────────────────────────────────
+
+// Queries are now stored in AppState::scan_queries so the frontend can
+// read and update them without restarting the backend.
 
 pub async fn start_scanner(state: Arc<AppState>) {
-    info!("🔍 Scanner started");
-    let mut cycle = 0u32;
+    info!("🔍 Scanner started — polling DexScreener every 30s");
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .unwrap_or_default();
+    let mut query_idx = 0usize;
+
     loop {
-        match cycle % 4 {
-            0 => { if let Err(e) = fetch_boosted(&state).await   { warn!("boosted: {}", e); } }
-            1 => { if let Err(e) = fetch_profiles(&state).await  { warn!("profiles: {}", e); } }
-            2 => { if let Err(e) = fetch_gainers(&state).await   { warn!("gainers: {}", e); } }
-            _ => { if let Err(e) = fetch_searches(&state).await  { warn!("search: {}", e); } }
-        }
-        cycle += 1;
-        sleep(Duration::from_secs(20)).await;
-    }
-}
+        // Read the current query list — lock must be dropped before any .await
+        let maybe_query: Option<String> = {
+            let queries = state.scan_queries.read();
+            if queries.is_empty() { None }
+            else { Some(queries[query_idx % queries.len()].clone()) }
+        }; // lock dropped here
 
-// ─── DATA SOURCES ─────────────────────────────────────────────────────────────
+        let query = match maybe_query {
+            None    => { sleep(Duration::from_secs(30)).await; continue; }
+            Some(q) => q,
+        };
+        query_idx += 1;
 
-/// Boosted/trending tokens — paid promotions, often have volume
-async fn fetch_boosted(state: &Arc<AppState>) -> Result<usize> {
-    let body: serde_json::Value = state.http
-        .get(format!("{}/token-boosts/top/v1", DEX))
-        .send().await?.json().await?;
+        let url = format!(
+            "https://api.dexscreener.com/latest/dex/search?q={}",
+            urlencoding::encode(&query)
+        );
 
-    let addrs: Vec<String> = body.as_array().unwrap_or(&vec![])
-        .iter()
-        .filter(|x| x["chainId"].as_str().unwrap_or("") == "solana")
-        .filter_map(|x| x["tokenAddress"].as_str().map(String::from))
-        .take(20).collect();
+        match client.get(&url).send().await {
+            Err(e) => warn!("Scanner fetch error: {}", e),
+            Ok(resp) => match resp.json::<DexResponse>().await {
+                Err(e) => warn!("Scanner parse error: {}", e),
+                Ok(data) => {
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64;
 
-    let pairs = fetch_pairs_for_tokens(state, &addrs).await;
-    let n = pairs.len();
-    process_pairs(pairs, state).await;
-    info!("🚀 {} boosted tokens", n);
-    Ok(n)
-}
+                    let tokens: Vec<DexToken> = data.pairs
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|p| p.chain_id == "solana")
+                        .filter_map(|p| {
+                            let liq   = p.liquidity.as_ref()?.usd?;
+                            if liq < 5_000.0 { return None; }
+                            let price: f64 = p.price_usd.as_deref()?.parse().ok()?;
+                            if price <= 0.0 { return None; }
+                            let vol   = p.volume.as_ref().and_then(|v| v.h24).unwrap_or(0.0);
+                            let h1    = p.price_change.as_ref().and_then(|c| c.h1).unwrap_or(0.0);
+                            let h24   = p.price_change.as_ref().and_then(|c| c.h24).unwrap_or(0.0);
+                            let buys  = p.txns.as_ref().and_then(|t| t.h1.as_ref()).and_then(|h| h.buys).unwrap_or(0);
+                            let sells = p.txns.as_ref().and_then(|t| t.h1.as_ref()).and_then(|h| h.sells).unwrap_or(0);
+                            let mc    = p.market_cap.unwrap_or(0.0);
+                            let age_h = p.pair_created_at.map(|ts| {
+                                now_ms.saturating_sub(ts) as f64 / 3_600_000.0
+                            }).unwrap_or(99.0);
 
-/// Latest token profiles — newest listings on DexScreener
-async fn fetch_profiles(state: &Arc<AppState>) -> Result<usize> {
-    let body: serde_json::Value = state.http
-        .get(format!("{}/token-profiles/latest/v1", DEX))
-        .send().await?.json().await?;
+                            let score = score_token(liq, vol, h1, buys, sells, age_h, mc);
+                            if score < 20 { return None; }
 
-    let addrs: Vec<String> = body.as_array().unwrap_or(&vec![])
-        .iter()
-        .filter(|x| x["chainId"].as_str().unwrap_or("") == "solana")
-        .filter_map(|x| x["tokenAddress"].as_str().map(String::from))
-        .take(20).collect();
+                            Some(DexToken {
+                                pair_address:     p.pair_address,
+                                symbol:           p.base_token.symbol,
+                                mint_address:     p.base_token.address,
+                                price_usd:        price,
+                                liquidity_usd:    liq,
+                                volume_h24:       vol,
+                                price_change_h1:  h1,
+                                price_change_h24: h24,
+                                buys_h1:          buys,
+                                sells_h1:         sells,
+                                age_hours:        age_h,
+                                market_cap:       mc,
+                                score,
+                                risk_level:       risk_of(score).to_string(),
+                                dex_url:          p.url.unwrap_or_default(),
+                            })
+                        })
+                        .collect();
 
-    let pairs = fetch_pairs_for_tokens(state, &addrs).await;
-    let n = pairs.len();
-    process_pairs(pairs, state).await;
-    info!("🆕 {} latest profiles", n);
-    Ok(n)
-}
-
-/// Wide keyword sweep — no single keyword, cast wide net
-async fn fetch_gainers(state: &Arc<AppState>) -> Result<usize> {
-    let terms = ["sol","pump","moon","inu","pepe","ai","cat","dog","baby","trump"];
-    let mut all = Vec::new();
-    for t in &terms {
-        let url = format!("{}/latest/dex/search?q={}", DEX, t);
-        if let Ok(resp) = state.http.get(&url).send().await {
-            if let Ok(body) = resp.json::<serde_json::Value>().await {
-                let pairs: Vec<DexPair> = serde_json::from_value(
-                    body["pairs"].clone()).unwrap_or_default();
-                all.extend(pairs.into_iter().filter(|p| p.chain_id == "solana"));
-            }
-        }
-        sleep(Duration::from_millis(150)).await;
-    }
-    let n = all.len();
-    process_pairs(all, state).await;
-    info!("📈 {} gainer pairs", n);
-    Ok(n)
-}
-
-/// DEX-specific searches — raydium, orca, pumpfun
-async fn fetch_searches(state: &Arc<AppState>) -> Result<usize> {
-    let terms = ["raydium","orca","bonk","wif","pnut","goat","mew","popcat","fartcoin","jto"];
-    let mut all = Vec::new();
-    for t in &terms {
-        let url = format!("{}/latest/dex/search?q={}", DEX, t);
-        if let Ok(resp) = state.http.get(&url).send().await {
-            if let Ok(body) = resp.json::<serde_json::Value>().await {
-                let pairs: Vec<DexPair> = serde_json::from_value(
-                    body["pairs"].clone()).unwrap_or_default();
-                all.extend(pairs.into_iter().filter(|p| p.chain_id == "solana"));
-            }
-        }
-        sleep(Duration::from_millis(150)).await;
-    }
-    let n = all.len();
-    process_pairs(all, state).await;
-    info!("🎯 {} dex search pairs", n);
-    Ok(n)
-}
-
-/// Fetch pair data for a list of token addresses
-async fn fetch_pairs_for_tokens(state: &Arc<AppState>, addrs: &[String]) -> Vec<DexPair> {
-    let mut all = Vec::new();
-    for addr in addrs {
-        let url = format!("{}/latest/dex/tokens/{}", DEX, addr);
-        if let Ok(resp) = state.http.get(&url).send().await {
-            if let Ok(data) = resp.json::<serde_json::Value>().await {
-                let pairs: Vec<DexPair> = serde_json::from_value(
-                    data["pairs"].clone()).unwrap_or_default();
-                all.extend(pairs);
-            }
-        }
-        sleep(Duration::from_millis(80)).await;
-    }
-    all
-}
-
-// ─── PROCESS + SCORE ──────────────────────────────────────────────────────────
-
-async fn process_pairs(pairs: Vec<DexPair>, state: &Arc<AppState>) {
-    let filter = state.scan_filter.read().clone();
-    let mut scored = Vec::new();
-    let mut seen   = std::collections::HashSet::new();
-
-    for pair in pairs {
-        if !seen.insert(pair.pair_address.clone()) { continue; }
-
-        // Only major quote tokens
-        let quote = pair.quote_token.symbol.to_uppercase();
-        if !["SOL","USDC","USDT"].contains(&quote.as_str()) { continue; }
-
-        // Blacklist
-        let sym = pair.base_token.symbol.to_uppercase();
-        if BLACKLIST.iter().any(|b| sym.contains(b)) { continue; }
-
-        let liq   = pair.liquidity.as_ref().and_then(|l| l.usd).unwrap_or(0.0);
-        let vol   = pair.volume.as_ref().and_then(|v| v.h24).unwrap_or(0.0);
-        let h1    = pair.price_change.as_ref().and_then(|p| p.h1).unwrap_or(0.0);
-        let buys  = pair.txns.as_ref().and_then(|t| t.h1.as_ref()).map(|b| b.buys).unwrap_or(0);
-        let age   = pair.pair_created_at.map(|c| {
-            (Utc::now().timestamp_millis() - c) as f64 / 3_600_000.0
-        }).unwrap_or(9999.0);
-
-        // ── Apply frontend filter ──────────────────────────────────────────
-        if liq  < filter.min_liquidity            { continue; }
-        if vol  < filter.min_volume               { continue; }
-        if age  > filter.max_age_hours            { continue; }
-        if h1   < filter.max_price_drop           { continue; }
-        if buys < filter.min_buys                 { continue; }
-        if filter.only_new     && age > 24.0      { continue; }
-        if filter.only_gainers && h1 <= 0.0       { continue; }
-        if !filter.dex_filter.is_empty() {
-            let dex = pair.dex_id.to_lowercase();
-            if !filter.dex_filter.iter().any(|d| dex.contains(d)) { continue; }
+                    // Merge into accumulated pool (update score if pair already known)
+                    {
+                        let mut pool = state.scanner_tokens.write();
+                        for token in tokens {
+                            if let Some(existing) = pool.iter_mut().find(|t| t.pair_address == token.pair_address) {
+                                // Refresh with latest price/score data
+                                *existing = token;
+                            } else {
+                                pool.push(token);
+                            }
+                        }
+                        // Re-rank and keep the top 100 across all queries
+                        pool.sort_by(|a, b| b.score.cmp(&a.score));
+                        pool.truncate(100);
+                    }
+                    let count = state.scanner_tokens.read().len();
+                    info!("📊 Scanner: {} tokens in pool (query: \"{}\")", count, query);
+                }
+            },
         }
 
-        let (score, signals) = score_token(&pair, age, liq, vol);
-        if score < filter.min_score { continue; }
-
-        let risk_level = if score >= 70 { RiskLevel::Safe }
-            else if score >= 45         { RiskLevel::Moderate }
-            else                        { RiskLevel::Degen };
-
-        let available   = state.portfolio.read().available_cash_usd;
-        let recommended = calc_position_size(score, available, &state.config);
-
-        scored.push(ScoredToken {
-            pair, score, risk_level, signals,
-            recommended_position_usd: recommended,
-            age_hours: age,
-            scanned_at: Utc::now(),
-        });
+        sleep(Duration::from_secs(30)).await;
     }
-
-    scored.sort_by(|a, b| b.score.cmp(&a.score));
-
-    // Merge into token store, evict stale (>5min)
-    {
-        let mut tokens = state.tokens.write();
-        for t in &scored { tokens.insert(t.pair.pair_address.clone(), t.clone()); }
-        let now = Utc::now();
-        tokens.retain(|_, v| (now - v.scanned_at).num_minutes() < 5);
-    }
-
-    if !scored.is_empty() {
-        let top: Vec<ScoredToken> = scored.into_iter().take(100).collect();
-        state.broadcast(WsMessage::TokenUpdate(top)).await;
-    }
-}
-
-// ─── SCORING ENGINE ───────────────────────────────────────────────────────────
-
-pub fn score_token(pair: &DexPair, age: f64, liq: f64, vol: f64) -> (u8, Vec<Signal>) {
-    let mut score: i32 = 0;
-    let mut sigs = Vec::new();
-
-    // Liquidity (max 25)
-    let ls = if liq >= 500_000.0 { 25 } else if liq >= 200_000.0 { 20 }
-        else if liq >= 100_000.0 { 15 } else if liq >= 50_000.0  { 10 }
-        else if liq >= 10_000.0  { 5  } else if liq >= 2_000.0   { 2  } else { -10 };
-    score += ls;
-    if ls >= 15 { sigs.push(sig(SignalKind::HighLiquidity,  &format!("Strong liq ${:.0}", liq), ls)); }
-    if ls < 0   { sigs.push(sig(SignalKind::LowLiquidity,  &format!("Low liq ${:.0}", liq), ls)); }
-
-    // Volume (max 20)
-    let vs = if vol >= 1_000_000.0 { 20 } else if vol >= 500_000.0 { 16 }
-        else if vol >= 100_000.0   { 12 } else if vol >= 50_000.0  { 8  }
-        else if vol >= 10_000.0    { 4  } else if vol >= 1_000.0   { 1  } else { -5 };
-    score += vs;
-    if vs >= 12 { sigs.push(sig(SignalKind::HighVolume, &format!("Vol ${:.0}", vol), vs)); }
-
-    // Momentum (max 25)
-    if let Some(pc) = &pair.price_change {
-        let h1  = pc.h1.unwrap_or(0.0);
-        let h6  = pc.h6.unwrap_or(0.0);
-        let ms = if h1 > 10.0 && h1 < 100.0 && h6 > 0.0 { 20 }
-            else if h1 > 5.0  { 15 } else if h1 > 2.0   { 8  }
-            else if h1 > 0.0  { 3  } else if h1 < -50.0 { -25}
-            else if h1 < -30.0{ -15} else if h1 < -15.0 { -8 } else { 0 };
-        score += ms;
-        if ms >= 15 { sigs.push(sig(SignalKind::BullishMomentum, &format!("h1 +{:.1}%", h1), ms)); }
-        if ms < -10 { sigs.push(sig(SignalKind::RugRisk, &format!("DUMP h1 {:.1}%", h1), ms)); }
-        // Acceleration bonus
-        let h24 = pc.h24.unwrap_or(0.0);
-        if h1 > 0.0 && h24 > 0.0 && h1 > h24 / 3.0 {
-            score += 5;
-            sigs.push(sig(SignalKind::PriceAcceleration, "Accelerating momentum", 5));
-        }
-    }
-
-    // Buy/sell ratio (max 20)
-    if let Some(txns) = &pair.txns {
-        if let Some(h1) = &txns.h1 {
-            let rs = if h1.sells == 0 && h1.buys > 5 { 20 }
-                else if h1.buys > 0 && h1.sells > 0 {
-                    let r = h1.buys as f64 / h1.sells as f64;
-                    if r > 3.0 { 20 } else if r > 2.0 { 14 } else if r > 1.5 { 8 }
-                    else if r > 1.0 { 3 } else if r > 0.7 { 0 } else { -12 }
-                } else { 0 };
-            score += rs;
-            if rs < 0 { sigs.push(sig(SignalKind::BuySellImbalance,
-                &format!("Sells>{} buys>{}", h1.sells, h1.buys), rs)); }
-        }
-    }
-
-    // Age (max 10)
-    let as_ = if age < 0.5 { -20 } else if age < 1.0 { -10 } else if age < 3.0 { -3 }
-        else if age < 6.0 { 3 } else if age < 24.0 { 7 } else if age < 72.0 { 10 } else { 5 };
-    score += as_;
-    if age < 1.0 { sigs.push(sig(SignalKind::NewToken,
-        &format!("{:.0}min old — caution", age*60.0), as_)); }
-
-    // Rug check
-    if let (Some(mc), Some(lq)) = (pair.market_cap, pair.liquidity.as_ref().and_then(|l| l.usd)) {
-        if mc > 0.0 && lq / mc < 0.01 {
-            score -= 20;
-            sigs.push(sig(SignalKind::SuspiciousActivity,
-                &format!("Liq/MCap {:.2}%", lq/mc*100.0), -20));
-        }
-    }
-
-    (score.clamp(0, 100) as u8, sigs)
-}
-
-fn sig(kind: SignalKind, msg: &str, w: i32) -> Signal {
-    Signal { kind, message: msg.to_string(), weight: w as i8 }
-}
-
-pub fn calc_position_size(score: u8, available: f64, config: &AppConfig) -> f64 {
-    let base = available * config.max_position_pct;
-    let mult = if score >= 75 { 1.0 } else if score >= 60 { 0.7 }
-               else if score >= 45 { 0.4 } else { 0.2 };
-    (base * mult).min(available * 0.15).max(0.5)
 }

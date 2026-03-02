@@ -1,7 +1,9 @@
 import { useState, useEffect, useReducer } from 'react'
 import { useWallet, useConnection }        from '@solana/wallet-adapter-react'
-import { LAMPORTS_PER_SOL }                from '@solana/web3.js'
-import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, LineChart, Line } from 'recharts'
+import { LAMPORTS_PER_SOL, PublicKey }     from '@solana/web3.js'
+
+const USDC_MINT = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v'
+import { AreaChart, Area, XAxis, YAxis, ResponsiveContainer } from 'recharts'
 
 import { WalletButton }            from './components/WalletButton.jsx'
 import { Scanner }                 from './components/Scanner.jsx'
@@ -35,10 +37,12 @@ export default function App() {
   const [tab,       setTab]       = useState('SCANNER')
   const [alerts,    dispatchAlert] = useReducer(alertReducer, [])
   const [solBal,    setSolBal]    = useState(null)
+  const [usdcBal,   setUsdcBal]  = useState(null)
   const [pnlSeries, setPnlSeries] = useState([])
   const [extPositions, setExtPositions] = useState([])
   const [extTrades,    setExtTrades]    = useState([])
   const [backendOn, setBackendOn] = useState(false)
+  const [portfolio, setPortfolio] = useState(null)
 
   const pushAlert = (level, message) =>
     dispatchAlert({ type: 'ADD', alert: { level, message } })
@@ -60,16 +64,37 @@ export default function App() {
     return () => clearInterval(iv)
   }, [publicKey, connection])
 
+  // ── USDC balance polling ────────────────────────────────────────────────
+  useEffect(() => {
+    if (!publicKey) { setUsdcBal(null); return }
+    const fetchUsdc = () =>
+      connection.getParsedTokenAccountsByOwner(publicKey, { mint: new PublicKey(USDC_MINT) })
+        .then(res => {
+          const amt = res.value[0]?.account.data.parsed.info.tokenAmount.uiAmount ?? 0
+          setUsdcBal(amt)
+        })
+        .catch(() => setUsdcBal(0))
+    fetchUsdc()
+    const iv = setInterval(fetchUsdc, 20000)
+    return () => clearInterval(iv)
+  }, [publicKey, connection])
+
   // ── WebSocket handler (backend data) ────────────────────────────────────
   useEffect(() => {
     if (!last) return
     const { type, payload } = last
+    
     if (type === 'PortfolioUpdate') {
+      setPortfolio(payload)
       setExtPositions(payload.positions || [])
       setExtTrades(payload.recent_trades || [])
     }
-    if (type === 'Alert')        pushAlert(payload.level, payload.message)
-    if (type === 'TradeExecuted') pushAlert('PROFIT', `⚡ ${payload.trade_type} ${payload.symbol}`)
+    if (type === 'Alert') {
+      pushAlert(payload.level, payload.message)
+    }
+    if (type === 'TradeExecuted') {
+      pushAlert('PROFIT', `⚡ ${payload}`)
+    }
   }, [last])
 
   // ── Backend health check ─────────────────────────────────────────────────
@@ -83,13 +108,17 @@ export default function App() {
   useEffect(() => {
     if (connected && publicKey)
       pushAlert('INFO', `✅ Wallet connected: ${publicKey.toBase58().slice(0,8)}…`)
-  }, [connected])
+  }, [connected, publicKey])
 
   const TABS = ['SCANNER','PORTFOLIO','WHALES','RISK ENGINE','ALERTS']
   const alertColor = { INFO:'#a0c4ff', WARNING:'#ffd700', CRITICAL:'#ff4466', PROFIT:'#00ff88' }
 
   // ── Unread alert badge ──────────────────────────────────────────────────
   const unread = alerts.length
+
+  // ── Paper trade mode ────────────────────────────────────────────────────
+  // Paper mode when backend confirms dry_run OR wallet is not connected
+  const isPaperMode = !connected || portfolio?.is_paper_trade !== false
 
   return (
     <div style={rootStyle}>
@@ -101,7 +130,12 @@ export default function App() {
       {/* ══════════════════════════════════════════════════ */}
       <header style={headerStyle}>
         <div style={{ display:'flex', flexDirection:'column', gap:2 }}>
-          <div style={logoStyle}>◈ SOLANA SNIPER</div>
+          <div style={{ display:'flex', alignItems:'center', gap:10 }}>
+            <div style={logoBadge}>
+              <img src="/sodagar_logo.png" alt="Sodagar" style={{ height:28, display:'block' }} />
+            </div>
+            <div style={logoStyle}>SODAGAR SNIPER</div>
+          </div>
           <div style={{ display:'flex', gap:8, alignItems:'center' }}>
             <StatusDot color={status==='LIVE'?'#00ff88':'#ff4466'} />
             <span style={{ color:'#2a5a6a', fontSize:9, letterSpacing:1 }}>
@@ -111,11 +145,25 @@ export default function App() {
         </div>
 
         <div style={{ display:'flex', gap:8, alignItems:'center', flexWrap:'wrap' }}>
+          <div style={balChip}>
+            <span style={{ color:'#2a5a6a', fontSize:9 }}>💰</span>
+            <span style={{ color:'#ffd700', fontWeight:'bold' }}>
+              ${(portfolio?.total_capital_usd ?? 100.0).toFixed(2)}
+            </span>
+            <span style={{ color:'#2a5a6a', fontSize:8 }}>CAPITAL</span>
+          </div>
           {solBal !== null && (
             <div style={balChip}>
               <span style={{ color:'#2a5a6a', fontSize:9 }}>◎</span>
               <span style={{ color:'#00dcb4', fontWeight:'bold' }}>{solBal.toFixed(4)}</span>
               <span style={{ color:'#2a5a6a', fontSize:9 }}>SOL</span>
+            </div>
+          )}
+          {usdcBal !== null && (
+            <div style={balChip}>
+              <span style={{ color:'#2a5a6a', fontSize:9 }}>$</span>
+              <span style={{ color:'#a0c4ff', fontWeight:'bold' }}>{usdcBal.toFixed(2)}</span>
+              <span style={{ color:'#2a5a6a', fontSize:9 }}>USDC</span>
             </div>
           )}
           <WalletButton />
@@ -156,6 +204,20 @@ export default function App() {
         ))}
       </nav>
 
+      {/* ── Paper trade banner ─────────────────────────── */}
+      {isPaperMode && (
+        <div style={paperBanner}>
+          <span style={{ color:'#ffd700', fontWeight:'bold', letterSpacing:2 }}>
+            📄 PAPER TRADING MODE
+          </span>
+          <span style={{ color:'#4a7a8a', fontSize:10, marginLeft:10 }}>
+            {connected
+              ? 'DRY_RUN=true — simulated trades only, no real money'
+              : 'Connect wallet to trade with real funds'}
+          </span>
+        </div>
+      )}
+
       {/* ══════════════════════════════════════════════════ */}
       {/* NOT CONNECTED BANNER                             */}
       {/* ══════════════════════════════════════════════════ */}
@@ -182,8 +244,11 @@ export default function App() {
         {tab === 'PORTFOLIO' && (
           <Portfolio
             onAlert={pushAlert}
+            portfolio={portfolio}
             externalPositions={extPositions}
             externalTrades={extTrades}
+            walletCapital={connected ? { sol: solBal, usdc: usdcBal } : null}
+            isPaperMode={isPaperMode}
           />
         )}
         {tab === 'WHALES' && (
@@ -273,21 +338,29 @@ const headerStyle = {
   padding:         '14px 20px 12px',
   borderBottom:    '1px solid rgba(0,220,180,0.12)',
   marginBottom:    10,
-  position:        'relative',
-  zIndex:          1,
-  background:      'rgba(2,5,9,0.8)',
-  backdropFilter:  'blur(8px)',
   position:        'sticky',
   top:             0,
+  zIndex:          100,
+  background:      'rgba(2,5,9,0.95)',
+  backdropFilter:  'blur(8px)',
+}
+
+const logoBadge = {
+  background:   'white',
+  borderRadius: 6,
+  padding:      '3px 6px',
+  display:      'flex',
+  alignItems:   'center',
+  flexShrink:   0,
 }
 
 const logoStyle = {
   fontFamily:    "'Orbitron', monospace",
   fontSize:      22,
   fontWeight:    900,
-  color:         '#00dcb4',
+  color:         '#ff6b35',
   letterSpacing: 4,
-  textShadow:    '0 0 30px rgba(0,220,180,0.5), 0 0 60px rgba(0,220,180,0.2)',
+  textShadow:    '0 0 30px rgba(255,107,53,0.5), 0 0 60px rgba(255,107,53,0.2)',
 }
 
 const balChip = {
@@ -331,6 +404,19 @@ const alertBadge = {
   borderRadius: '50%', width:16, height:16,
   display:'flex', alignItems:'center', justifyContent:'center',
   fontSize:8, fontWeight:'bold',
+}
+
+const paperBanner = {
+  margin:     '0 20px 8px',
+  padding:    '7px 14px',
+  background: 'rgba(255,215,0,0.05)',
+  border:     '1px solid rgba(255,215,0,0.25)',
+  borderRadius: 4,
+  display:    'flex',
+  alignItems: 'center',
+  fontSize:   11,
+  position:   'relative',
+  zIndex:     1,
 }
 
 const walletBanner = {

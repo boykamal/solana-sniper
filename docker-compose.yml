@@ -26,13 +26,14 @@ services:
   # ── REACT FRONTEND ──────────────────────────────────────────────────────────
   frontend:
     build:
-      context: ./frontend
+      context: ./sniper-frontend
       dockerfile: Dockerfile
     container_name: sniper-frontend
     restart: unless-stopped
     environment:
       - VITE_API_URL=
       - VITE_WS_URL=
+      - VITE_RPC_ENDPOINT=
     networks:
       - sniper-net
     depends_on:

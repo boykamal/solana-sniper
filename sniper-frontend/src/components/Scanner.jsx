@@ -1,11 +1,8 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useRef } from 'react'
 import { useWallet } from '@solana/wallet-adapter-react'
 import { useWalletTrading } from '../hooks/useWalletTrading.js'
-import { dex } from '../lib/api.js'
+import { dex, api } from '../lib/api.js'
 import { FilterDialog } from './FilterDialog.jsx'
-
-const QUERIES = ['solana meme','solana bonk pump','solana cat dog','solana ai meme','solana pepe']
-let qIdx = 0
 
 function scoreToken(pair) {
   let s = 0
@@ -49,20 +46,60 @@ const fmtLiq = v => v>=1e6?`$${(v/1e6).toFixed(1)}M`:v>=1000?`$${(v/1000).toFixe
 export function Scanner({ onAlert, portfolio }) {
   const { connected, publicKey }        = useWallet()
   const { buyWithSol, buyWithUsdc, loading } = useWalletTrading()
-  const [tokens,   setTokens]           = useState([])
-  const [filter,   setFilter]           = useState('ALL')
-  const [selected, setSelected]         = useState(null)
-  const [buyMode,  setBuyMode]          = useState('SOL')  // 'SOL' | 'USDC'
-  const [buyAmt,   setBuyAmt]           = useState('')
-  const [txStatus, setTxStatus]         = useState('')
-  const [scanning, setScanning]         = useState(false)
-  const [showFilter, setShowFilter]       = useState(false)
-  const [sortBy,   setSortBy]           = useState('score')
+  const [tokens,      setTokens]        = useState([])
+  const [filter,      setFilter]        = useState('ALL')
+  const [selected,    setSelected]      = useState(null)
+  const [buyMode,     setBuyMode]       = useState('SOL')
+  const [buyAmt,      setBuyAmt]        = useState('')
+  const [txStatus,    setTxStatus]      = useState('')
+  const [scanning,    setScanning]      = useState(false)
+  const [showFilter,  setShowFilter]    = useState(false)
+  const [sortBy,      setSortBy]        = useState('score')
+
+  // ── Query editor state ────────────────────────────────────────────────────
+  const [queries,     setQueries]       = useState([])
+  const [queryInput,  setQueryInput]    = useState('')
+  const [showQueries, setShowQueries]   = useState(false)
+  const [queryDirty,  setQueryDirty]    = useState(false)
+  const [querySaving, setQuerySaving]   = useState(false)
+  const qIdxRef = useRef(0)
+
+  // Fetch queries from backend on mount
+  useEffect(() => {
+    api.scanQueries()
+      .then(r => setQueries(r.data || []))
+      .catch(() => {})
+  }, [])
+
+  const addQuery = () => {
+    const q = queryInput.trim().toLowerCase()
+    if (!q || queries.includes(q)) return
+    setQueries(prev => [...prev, q])
+    setQueryInput('')
+    setQueryDirty(true)
+  }
+  const removeQuery = (idx) => {
+    setQueries(prev => prev.filter((_, i) => i !== idx))
+    setQueryDirty(true)
+  }
+  const saveQueries = async () => {
+    setQuerySaving(true)
+    try {
+      await api.saveScanQueries(queries)
+      setQueryDirty(false)
+      onAlert('INFO', `✅ Scan queries saved (${queries.length} active)`)
+    } catch (e) {
+      onAlert('CRITICAL', `❌ Failed to save queries: ${e.message}`)
+    }
+    setQuerySaving(false)
+  }
 
   const scan = useCallback(async () => {
+    if (queries.length === 0) return
     setScanning(true)
     try {
-      const q    = QUERIES[qIdx++ % QUERIES.length]
+      const q = queries[qIdxRef.current % queries.length]
+      qIdxRef.current += 1
       const data = await dex.search(q)
       const pairs = (data.pairs || [])
         .filter(p => p.chainId === 'solana' && parseFloat(p.liquidity?.usd || 0) > 5000)
@@ -79,9 +116,9 @@ export function Scanner({ onAlert, portfolio }) {
       setTokens(pairs)
     } catch {}
     setScanning(false)
-  }, [])
+  }, [queries])
 
-  useEffect(() => { scan() }, [])
+  useEffect(() => { scan() }, [scan])
   useEffect(() => {
     const iv = setInterval(scan, 30_000)
     return () => clearInterval(iv)
@@ -155,7 +192,79 @@ export function Scanner({ onAlert, portfolio }) {
         <button style={filterBtn(false,'#ffd700')} onClick={() => setShowFilter(true)}>
           ⚙ FILTER
         </button>
+        <button
+          style={filterBtn(showQueries, '#c084fc')}
+          onClick={() => setShowQueries(v => !v)}
+        >
+          🔍 QUERIES ({queries.length})
+        </button>
       </div>
+
+      {/* ── Query editor ── */}
+      {showQueries && (
+        <div style={{ ...card, border: '1px solid rgba(192,132,252,0.25)', marginBottom: 10 }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
+            <span style={{ color: '#c084fc', fontSize: 10, letterSpacing: 1.5 }}>
+              🔍 SCAN QUERIES — one fires every 30s, results merge into pool
+            </span>
+            <div style={{ display: 'flex', gap: 6 }}>
+              {queryDirty && (
+                <button
+                  style={{ ...filterBtn(true, '#00ff88'), opacity: querySaving ? 0.5 : 1 }}
+                  onClick={saveQueries}
+                  disabled={querySaving}
+                >
+                  {querySaving ? '…' : '💾 SAVE'}
+                </button>
+              )}
+              <button
+                style={filterBtn(false, '#ff4466')}
+                onClick={() => { setShowQueries(false) }}
+              >
+                ✕
+              </button>
+            </div>
+          </div>
+
+          {/* Current queries as tags */}
+          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6, marginBottom: 10 }}>
+            {queries.map((q, i) => (
+              <div key={i} style={queryTag}>
+                <span style={{ color: '#c8d8e8', fontSize: 10 }}>{q}</span>
+                <button
+                  style={{ background: 'none', border: 'none', color: '#ff4466',
+                    cursor: 'pointer', padding: '0 2px', fontSize: 11, lineHeight: 1 }}
+                  onClick={() => removeQuery(i)}
+                >
+                  ×
+                </button>
+              </div>
+            ))}
+            {queries.length === 0 && (
+              <span style={{ color: '#2a4a5a', fontSize: 10 }}>No queries — add one below</span>
+            )}
+          </div>
+
+          {/* Add new query */}
+          <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+            <input
+              value={queryInput}
+              onChange={e => setQueryInput(e.target.value)}
+              onKeyDown={e => e.key === 'Enter' && addQuery()}
+              placeholder='e.g. "solana ai" or "solana layer2"'
+              style={{ ...queryInput_style, flex: 1 }}
+            />
+            <button style={filterBtn(false, '#c084fc')} onClick={addQuery}>
+              + ADD
+            </button>
+          </div>
+          <div style={{ color: '#2a4a5a', fontSize: 9, marginTop: 6 }}>
+            DexScreener matches tokens whose name/symbol contains these words.
+            Broad terms like "solana" or "sol" catch any narrative.
+            Hit SAVE to apply to both the display and backend auto-trader.
+          </div>
+        </div>
+      )}
 
       {/* ── Table ── */}
       <div style={card}>
@@ -380,6 +489,17 @@ const card = {
 }
 const th    = { color:'#2a5a6a', fontSize:9, letterSpacing:1 }
 const label = { color:'#2a5a6a', fontSize:9, letterSpacing:1 }
+
+const queryTag = {
+  display: 'flex', alignItems: 'center', gap: 4,
+  background: 'rgba(192,132,252,0.08)', border: '1px solid rgba(192,132,252,0.25)',
+  borderRadius: 4, padding: '3px 8px',
+}
+const queryInput_style = {
+  background: '#020509', border: '1px solid rgba(192,132,252,0.25)',
+  color: '#c8d8e8', padding: '6px 10px', borderRadius: 4, fontSize: 10,
+  fontFamily: "'IBM Plex Mono',monospace", outline: 'none',
+}
 
 const filterBtn = (active, c) => ({
   background:   active ? `${c}18` : 'transparent',
