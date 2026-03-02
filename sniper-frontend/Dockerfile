@@ -1,10 +1,13 @@
 FROM node:20-alpine AS builder
 
+# Install Python and build tools for native modules
+RUN apk add --no-cache python3 make g++ gcc libc-dev linux-headers
+
 WORKDIR /app
 COPY package.json ./
 RUN npm install --legacy-peer-deps
 
-# Add these lines - accept build args
+# Accept build args
 ARG VITE_API_URL
 ARG VITE_WS_URL
 ARG VITE_RPC_ENDPOINT
