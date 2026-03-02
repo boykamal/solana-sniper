@@ -1,8 +1,4 @@
-version: '3.9'
-
 services:
-
-  # ── RUST BACKEND ────────────────────────────────────────────────────────────
   backend:
     build:
       context: ./backend
@@ -14,7 +10,9 @@ services:
       - RUST_LOG=solana_sniper=info
       - PORT=8080
     ports:
-      - "8080:8080"
+      - "8088:8080"  # Exposed for direct API access (optional)
+    expose:
+      - "8080"       # Internal for Nginx
     networks:
       - sniper-net
     healthcheck:
@@ -23,23 +21,23 @@ services:
       timeout: 10s
       retries: 3
 
-  # ── REACT FRONTEND ──────────────────────────────────────────────────────────
   frontend:
     build:
       context: ./sniper-frontend
       dockerfile: Dockerfile
+      args:
+        - VITE_API_URL=https://sniper.logisspace.com/api
+        - VITE_WS_URL=wss://sniper.logisspace.com/ws
+        - VITE_RPC_ENDPOINT=${SOLANA_RPC_URL}
     container_name: sniper-frontend
     restart: unless-stopped
-    environment:
-      - VITE_API_URL=
-      - VITE_WS_URL=
-      - VITE_RPC_ENDPOINT=
+    expose:
+      - "80"
     networks:
       - sniper-net
     depends_on:
       - backend
 
-  # ── NGINX REVERSE PROXY ─────────────────────────────────────────────────────
   nginx:
     image: nginx:alpine
     container_name: sniper-nginx
