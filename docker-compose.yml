@@ -8,15 +8,15 @@ services:
     env_file: .env
     environment:
       - RUST_LOG=solana_sniper=info
-      - PORT=8080
+      # PORT=3013 comes from .env file
     ports:
-      - "8088:8080"  # Exposed for direct API access (optional)
+      - "8088:3013"  # External 8088 → Internal 3013 (matches your .env)
     expose:
-      - "8080"       # Internal for Nginx
+      - "3013"        # For Nginx internal communication
     networks:
       - sniper-net
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:3013/health"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -28,7 +28,7 @@ services:
       args:
         - VITE_API_URL=https://sniper.logisspace.com/api
         - VITE_WS_URL=wss://sniper.logisspace.com/ws
-        - VITE_RPC_ENDPOINT=${SOLANA_RPC_URL}
+        - VITE_RPC_ENDPOINT=${RPC_ENDPOINT}
     container_name: sniper-frontend
     restart: unless-stopped
     expose:
