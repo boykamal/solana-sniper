@@ -1,0 +1,154 @@
+# ============================================
+# SECURITY - Environment & Secrets (CRITICAL)
+# ============================================
+.env
+.env.local
+.env.*.local
+.env.development
+.env.production
+.env.test
+!.env.example
+!.env.*.example
+
+# Solana specific - NEVER commit keypairs
+*.key
+*.keypair
+id.json
+keypair.json
+wallet.json
+*-keypair.json
+**/*wallet*.json
+!wallet*.example.json
+
+# ============================================
+# OS & Editor Files
+# ============================================
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# IDE - VSCode
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+*.code-workspace
+
+# IDE - JetBrains (RustRover, IntelliJ)
+.idea/
+*.iml
+*.iws
+*.ipr
+
+# IDE - Vim/Neovim
+*.swp
+*.swo
+*~
+.nvimrc
+
+# ============================================
+# Rust Backend (/backend)
+# ============================================
+# Cargo build artifacts
+/backend/target/
+/backend/**/target/
+**/*.rs.bk
+*.pdb
+
+# Cargo.lock should be committed for binaries, ignored for libraries
+# Since this is a sniper bot (binary), you may want to track Cargo.lock
+# Uncomment next line only if this is a library:
+# /backend/Cargo.lock
+
+# Rust profiling
+/backend/flamegraph.svg
+/backend/cargo-timing*.html
+
+# ============================================
+# Node Frontend (/sniper-frontend)
+# ============================================
+# Dependencies
+/sniper-frontend/node_modules/
+/sniper-frontend/.pnp
+/sniper-frontend/.pnp.js
+
+# Build outputs
+/sniper-frontend/dist/
+/sniper-frontend/dist-ssr/
+/sniper-frontend/build/
+/sniper-frontend/*.local
+
+# Testing
+/sniper-frontend/coverage/
+/sniper-frontend/.nyc_output/
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# TypeScript cache
+*.tsbuildinfo
+
+# Optional npm cache directory
+.npm
+.eslintcache
+.stylelintcache
+
+# Vite specific
+/sniper-frontend/.vite/
+
+# ============================================
+# Docker
+# ============================================
+# Local volume mounts (if any)
+data/
+postgres_data/
+redis_data/
+*.volume
+.dockerignore
+
+# ============================================
+# Logs & Databases
+# ============================================
+*.log
+logs/
+*.sql
+*.sqlite
+*.sqlite3
+
+# ============================================
+# Temporary files
+# ============================================
+tmp/
+temp/
+*.tmp
+*.temp
+*.cache
+.cache/
+
+# ============================================
+# Solana Specific
+# ============================================
+# Program artifacts (if building programs)
+**/.anchor/
+**/target/deploy/
+**/target/idl/
+**/target/types/
+
+# Ledger for local testing
+test-ledger/
+ledger/
+
+# BPF tools
+.bpf-tools/
+
+# Solana CLI config (if present)
+config.yml
+solana-config.yml

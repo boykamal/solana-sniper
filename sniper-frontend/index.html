@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>◈ Solana Sniper</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;600;700&family=Orbitron:wght@400;600;800;900&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html { height: 100%; }
+    body {
+      height: 100%;
+      background: #020509;
+      color: #c8d8e8;
+      font-family: 'IBM Plex Mono', monospace;
+      overflow-x: hidden;
+    }
+    #root { height: 100%; }
+
+    /* Scrollbar */
+    ::-webkit-scrollbar       { width: 3px; height: 3px; }
+    ::-webkit-scrollbar-track { background: #050d14; }
+    ::-webkit-scrollbar-thumb { background: rgba(0,220,180,0.3); border-radius: 2px; }
+
+    /* Wallet adapter overrides */
+    .wallet-adapter-button {
+      background: transparent !important;
+      border: 1px solid rgba(0,220,180,0.4) !important;
+      color: #00dcb4 !important;
+      font-family: 'IBM Plex Mono', monospace !important;
+      font-size: 11px !important;
+      padding: 8px 16px !important;
+      border-radius: 4px !important;
+      letter-spacing: 1px !important;
+      transition: all 0.2s !important;
+    }
+    .wallet-adapter-button:hover {
+      background: rgba(0,220,180,0.1) !important;
+      border-color: #00dcb4 !important;
+    }
+    .wallet-adapter-button-trigger {
+      background: rgba(0,220,180,0.08) !important;
+    }
+    .wallet-adapter-modal-wrapper {
+      background: #050d14 !important;
+      border: 1px solid rgba(0,220,180,0.2) !important;
+      font-family: 'IBM Plex Mono', monospace !important;
+    }
+    .wallet-adapter-modal-title {
+      color: #00dcb4 !important;
+      font-family: 'Orbitron', monospace !important;
+    }
+    .wallet-adapter-modal-list li { border-bottom: 1px solid #0a1a24 !important; }
+    .wallet-adapter-modal-list-more { color: #4a7a8a !important; }
+    .wallet-adapter-modal-button-close { background: #0a1a24 !important; }
+    .wallet-adapter-modal-button-close svg { fill: #4a7a8a !important; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="module" src="/src/main.jsx"></script>
+</body>
+</html>

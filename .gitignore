@@ -1,0 +1,50 @@
+# ============================================
+# SECURITY - Environment & Secrets
+# ============================================
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# Solana keypairs
+*.key
+*.keypair
+id.json
+wallet.json
+*-keypair.json
+
+# ============================================
+# Rust Backend
+# ============================================
+/backend/target/
+**/*.rs.bk
+Cargo.lock
+
+# ============================================
+# Node Frontend (CRITICAL)
+# ============================================
+/sniper-frontend/node_modules/
+/sniper-frontend/dist/
+/sniper-frontend/dist-ssr/
+/sniper-frontend/build/
+/sniper-frontend/*.local
+
+# Logs
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# ============================================
+# OS & Editor
+# ============================================
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*~
+
+# ============================================
+# Docker
+# ============================================
+data/
+*.volume
