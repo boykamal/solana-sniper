@@ -29,6 +29,7 @@ services:
         - VITE_API_URL=https://sniper.logisspace.com/api
         - VITE_WS_URL=wss://sniper.logisspace.com/ws
         - VITE_RPC_ENDPOINT=${RPC_ENDPOINT}
+        - VITE_HELIUS_KEY=${VITE_HELIUS_KEY}
     container_name: sniper-frontend
     restart: unless-stopped
     expose:
