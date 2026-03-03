@@ -102,6 +102,17 @@ fn risk_of(score: u8) -> &'static str {
     if score >= 70 { "SAFE" } else if score >= 45 { "MODERATE" } else { "DEGEN" }
 }
 
+// ── Phase detection ───────────────────────────────────────────────────────────
+
+fn detect_phase(h1: f64, h24: f64, vol_h24: f64, buys: u64, sells: u64) -> String {
+    let ratio = if sells > 0 { buys as f64 / sells as f64 } else { 3.0 };
+    if h1 < -25.0 && ratio < 0.8                         { return "DUMP".into(); }
+    if h1 < -5.0  && ratio < 0.9 && h24 > 10.0          { return "DISTRIBUTION".into(); }
+    if h1 > 30.0  && ratio > 1.8 && vol_h24 > 100_000.0 { return "MANIA".into(); }
+    if h1 > 5.0   && ratio > 1.2                         { return "AWARENESS".into(); }
+    "STEALTH".into()
+}
+
 // ── Scanner loop ──────────────────────────────────────────────────────────────
 
 // Queries are now stored in AppState::scan_queries so the frontend can
@@ -166,6 +177,7 @@ pub async fn start_scanner(state: Arc<AppState>) {
                             let score = score_token(liq, vol, h1, buys, sells, age_h, mc);
                             if score < 20 { return None; }
 
+                            let phase = detect_phase(h1, h24, vol, buys, sells);
                             Some(DexToken {
                                 pair_address:     p.pair_address,
                                 symbol:           p.base_token.symbol,
@@ -182,17 +194,36 @@ pub async fn start_scanner(state: Arc<AppState>) {
                                 score,
                                 risk_level:       risk_of(score).to_string(),
                                 dex_url:          p.url.unwrap_or_default(),
+                                phase,
+                                rug_score:        None,
+                                lp_locked_pct:    None,
+                                mint_disabled:    None,
+                                top10_pct:        None,
+                                rug_flags:        Vec::new(),
+                                boost_amount:     None,
                             })
                         })
                         .collect();
 
-                    // Merge into accumulated pool (update score if pair already known)
+                    // Merge into accumulated pool (update price/score, preserve rug enrichment)
                     {
                         let mut pool = state.scanner_tokens.write();
                         for token in tokens {
                             if let Some(existing) = pool.iter_mut().find(|t| t.pair_address == token.pair_address) {
-                                // Refresh with latest price/score data
+                                // Preserve rug enrichment set by rug_checker background task
+                                let rug_score     = existing.rug_score;
+                                let lp_locked_pct = existing.lp_locked_pct;
+                                let mint_disabled = existing.mint_disabled;
+                                let top10_pct     = existing.top10_pct;
+                                let rug_flags     = std::mem::take(&mut existing.rug_flags);
+                                let boost_amount  = existing.boost_amount;
                                 *existing = token;
+                                existing.rug_score     = rug_score;
+                                existing.lp_locked_pct = lp_locked_pct;
+                                existing.mint_disabled = mint_disabled;
+                                existing.top10_pct     = top10_pct;
+                                existing.rug_flags     = rug_flags;
+                                existing.boost_amount  = boost_amount;
                             } else {
                                 pool.push(token);
                             }

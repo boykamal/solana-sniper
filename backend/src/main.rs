@@ -3,6 +3,8 @@ mod state;
 mod scanner;
 mod risk;
 mod auto_trader;
+mod rug_checker;
+mod social_monitor;
 mod api;
 
 use std::net::SocketAddr;
@@ -51,6 +53,10 @@ async fn main() -> Result<()> {
     tokio::spawn(async move { risk::start_risk_monitor(risk_state).await; });
     let auto_state = state.clone();
     tokio::spawn(async move { auto_trader::start_auto_trader(auto_state).await; });
+    let rug_state = state.clone();
+    tokio::spawn(async move { rug_checker::start_rug_checker(rug_state).await; });
+    let social_state = state.clone();
+    tokio::spawn(async move { social_monitor::start_social_monitor(social_state).await; });
 
     let port: u16 = std::env::var("PORT").unwrap_or_else(|_| "8080".into()).parse()?;
     let addr = SocketAddr::from(([0,0,0,0], port));

@@ -40,6 +40,9 @@ export const api = {
     method: 'POST',
     body: JSON.stringify({ queries }),
   }),
+
+  // On-demand Rugcheck enrichment (cached after first fetch)
+  getRug: (mint) => call(`/api/rug/${mint}`),
 }
 
 // DexScreener direct (no proxy needed)

@@ -4,6 +4,15 @@ import { useWalletTrading } from '../hooks/useWalletTrading.js'
 import { dex, api } from '../lib/api.js'
 import { FilterDialog } from './FilterDialog.jsx'
 
+function detectPhase(h1, h24, vol, buys, sells) {
+  const ratio = sells > 0 ? buys / sells : 3
+  if (h1 < -25 && ratio < 0.8)                    return 'DUMP'
+  if (h1 < -5  && ratio < 0.9 && h24 > 10)        return 'DISTRIBUTION'
+  if (h1 > 30  && ratio > 1.8 && vol > 100_000)   return 'MANIA'
+  if (h1 > 5   && ratio > 1.2)                    return 'AWARENESS'
+  return 'STEALTH'
+}
+
 function scoreToken(pair) {
   let s = 0
   const liq  = parseFloat(pair.liquidity?.usd  || 0)
@@ -42,6 +51,13 @@ const riskOf = s => s>=70?'SAFE':s>=45?'MODERATE':'DEGEN'
 const scoreColor = s => s>=70?'#00ff88':s>=45?'#ffd700':'#ff6b35'
 const pnlColor   = v => parseFloat(v)>=0?'#00ff88':'#ff4466'
 const fmtLiq = v => v>=1e6?`$${(v/1e6).toFixed(1)}M`:v>=1000?`$${(v/1000).toFixed(0)}k`:`$${v.toFixed(0)}`
+const fmtAge = h => {
+  if (h < 1)    return `${(h * 60).toFixed(0)}m`
+  if (h < 24)   return `${h.toFixed(0)}h`
+  if (h < 720)  return `${(h / 24).toFixed(0)}d`
+  if (h < 8760) return `${(h / 720).toFixed(0)}mo`
+  return `${(h / 8760).toFixed(1)}y`
+}
 
 export function Scanner({ onAlert, portfolio }) {
   const { connected, publicKey }        = useWallet()
@@ -55,6 +71,23 @@ export function Scanner({ onAlert, portfolio }) {
   const [scanning,    setScanning]      = useState(false)
   const [showFilter,  setShowFilter]    = useState(false)
   const [sortBy,      setSortBy]        = useState('score')
+
+  // ── Rug analysis state ────────────────────────────────────────────────────
+  const [rugData,     setRugData]     = useState(null)
+  const [rugLoading,  setRugLoading]  = useState(false)
+
+  // Fetch rug data whenever a token is selected
+  useEffect(() => {
+    if (!selected) { setRugData(null); return }
+    const mint = selected.baseToken?.address
+    if (!mint) return
+    setRugLoading(true)
+    setRugData(null)
+    api.getRug(mint)
+      .then(r => setRugData(r.data || null))
+      .catch(() => setRugData(null))
+      .finally(() => setRugLoading(false))
+  }, [selected])
 
   // ── Query editor state ────────────────────────────────────────────────────
   const [queries,     setQueries]       = useState([])
@@ -104,11 +137,15 @@ export function Scanner({ onAlert, portfolio }) {
       const pairs = (data.pairs || [])
         .filter(p => p.chainId === 'solana' && parseFloat(p.liquidity?.usd || 0) > 5000)
         .map(p => {
-          const age = p.pairCreatedAt
-            ? (Date.now() - p.pairCreatedAt) / 3_600_000
-            : 99
-          const sc = scoreToken({ ...p, _age: age })
-          return { ...p, _score: sc, _risk: riskOf(sc), _age: age }
+          const age  = p.pairCreatedAt ? (Date.now() - p.pairCreatedAt) / 3_600_000 : 99
+          const h1   = parseFloat(p.priceChange?.h1  || 0)
+          const h24  = parseFloat(p.priceChange?.h24 || 0)
+          const vol  = parseFloat(p.volume?.h24 || 0)
+          const buys = p.txns?.h1?.buys  || 0
+          const sels = p.txns?.h1?.sells || 0
+          const sc    = scoreToken({ ...p, _age: age })
+          const phase = detectPhase(h1, h24, vol, buys, sels)
+          return { ...p, _score: sc, _risk: riskOf(sc), _age: age, _phase: phase }
         })
         .filter(p => p._score >= 20)
         .sort((a, b) => b._score - a._score)
@@ -270,16 +307,14 @@ export function Scanner({ onAlert, portfolio }) {
       <div style={card}>
         <div style={{ display: 'grid', gridTemplateColumns: TBL_COLS,
           padding: '4px 8px', borderBottom: '1px solid rgba(0,220,180,0.15)', gap: 4, ...th }}>
-          <span>TOKEN</span><span>SCORE</span><span>PRICE</span>
-          <span>1H%</span><span>24H%</span><span>LIQ</span><span>B/S</span><span>AGE</span><span>ACTION</span>
+          <span>TOKEN</span><span>SCORE</span><span>PHASE</span>
+          <span>PRICE</span><span>1H%</span><span>24H%</span><span>LIQ</span><span>AGE</span><span>ACTION</span>
         </div>
         <div style={{ maxHeight: 380, overflowY: 'auto' }}>
           {sorted.map((t, i) => {
-            const h1   = parseFloat(t.priceChange?.h1  || 0)
-            const h24  = parseFloat(t.priceChange?.h24 || 0)
-            const liq  = t.liquidity?.usd  || 0
-            const buys = t.txns?.h1?.buys  || 0
-            const sels = t.txns?.h1?.sells || 0
+            const h1  = parseFloat(t.priceChange?.h1  || 0)
+            const h24 = parseFloat(t.priceChange?.h24 || 0)
+            const liq = t.liquidity?.usd || 0
             const isSelected = selected?.pairAddress === t.pairAddress
             return (
               <div key={t.pairAddress + i}
@@ -294,13 +329,22 @@ export function Scanner({ onAlert, portfolio }) {
                 onMouseLeave={e => { if(!isSelected) e.currentTarget.style.background=
                   t._score>=70?'rgba(0,255,136,0.02)':t._score>=45?'rgba(255,215,0,0.02)':'transparent' }}
                 onClick={() => setSelected(isSelected ? null : t)}>
-                <span style={{ color:'#e8f4ff', fontWeight:600, fontSize:11,
-                  overflow:'hidden', whiteSpace:'nowrap', textOverflow:'ellipsis' }}>
-                  {t.baseToken?.symbol?.slice(0,9)}
-                </span>
+                <div style={{ display:'flex', alignItems:'center', gap:4, overflow:'hidden' }}>
+                  {t.info?.imageUrl
+                    ? <img src={t.info.imageUrl} alt="" style={{ width:16, height:16, borderRadius:'50%', flexShrink:0 }}
+                        onError={e => { e.target.style.display='none' }} />
+                    : <span style={{ width:16, height:16, borderRadius:'50%', background:'rgba(0,220,180,0.15)',
+                        flexShrink:0, display:'inline-block' }} />
+                  }
+                  <span style={{ color:'#e8f4ff', fontWeight:600, fontSize:11,
+                    overflow:'hidden', whiteSpace:'nowrap', textOverflow:'ellipsis' }}>
+                    {t.baseToken?.symbol?.slice(0,8)}
+                  </span>
+                </div>
                 <span style={{ color: scoreColor(t._score), fontWeight:'bold', fontSize:11 }}>
                   {t._score}
                 </span>
+                <span style={phaseTag(t._phase)}>{t._phase}</span>
                 <span style={{ color:'#8fb8d0', fontSize:10 }}>
                   {parseFloat(t.priceUsd||0) < 0.001
                     ? `$${parseFloat(t.priceUsd||0).toExponential(2)}`
@@ -313,11 +357,8 @@ export function Scanner({ onAlert, portfolio }) {
                   {h24>=0?'+':''}{h24.toFixed(1)}%
                 </span>
                 <span style={{ color:'#8fb8d0', fontSize:10 }}>{fmtLiq(liq)}</span>
-                <span style={{ color: buys>sels?'#00ff88':'#ff4466', fontSize:10 }}>
-                  {buys}/{sels}
-                </span>
                 <span style={{ color:'#4a7a8a', fontSize:10 }}>
-                  {t._age < 1 ? `${(t._age*60).toFixed(0)}m` : `${t._age.toFixed(0)}h`}
+                  {fmtAge(t._age)}
                 </span>
                 <div style={{ display:'flex', gap:3 }}>
                   <button style={snipeBtn('#00ff88')}
@@ -346,6 +387,11 @@ export function Scanner({ onAlert, portfolio }) {
           <div style={{ display:'flex', justifyContent:'space-between', alignItems:'flex-start', marginBottom:12 }}>
             <div>
               <div style={{ display:'flex', alignItems:'center', gap:10, flexWrap:'wrap' }}>
+                {selected.info?.imageUrl
+                  ? <img src={selected.info.imageUrl} alt="" style={{ width:36, height:36, borderRadius:'50%', flexShrink:0 }}
+                      onError={e => { e.target.style.display='none' }} />
+                  : null
+                }
                 <span style={{ color:'#00dcb4', fontFamily:"'Orbitron',monospace", fontSize:18, fontWeight:800 }}>
                   {selected.baseToken?.symbol}
                 </span>
@@ -353,6 +399,7 @@ export function Scanner({ onAlert, portfolio }) {
                 <span style={{ color:scoreColor(selected._score), fontWeight:'bold' }}>
                   SCORE {selected._score}
                 </span>
+                <span style={phaseTag(selected._phase)}>{selected._phase}</span>
               </div>
               <div style={{ color:'#4a7a8a', fontSize:9, marginTop:4, fontFamily:'monospace' }}>
                 {selected.baseToken?.address}
@@ -373,13 +420,85 @@ export function Scanner({ onAlert, portfolio }) {
               ['1H CHANGE',`${parseFloat(selected.priceChange?.h1||0).toFixed(2)}%`],
               ['6H CHANGE',`${parseFloat(selected.priceChange?.h6||0).toFixed(2)}%`],
               ['24H CHANGE',`${parseFloat(selected.priceChange?.h24||0).toFixed(2)}%`],
-              ['AGE',      selected._age<1?`${(selected._age*60).toFixed(0)}min`:`${selected._age.toFixed(1)}h`],
+              ['AGE',      fmtAge(selected._age)],
             ].map(([k,v]) => (
               <div key={k} style={statItem}>
                 <div style={{ color:'#2a5a6a', fontSize:8, letterSpacing:1 }}>{k}</div>
                 <div style={{ color:'#c8d8e8', marginTop:2, fontSize:11 }}>{v}</div>
               </div>
             ))}
+          </div>
+
+          {/* ── Rug analysis panel ── */}
+          <div style={{ marginBottom:12 }}>
+            {rugLoading && (
+              <div style={{ color:'#4a7a8a', fontSize:10, padding:'8px 0' }}>
+                🛡️ Fetching rug analysis…
+              </div>
+            )}
+            {!rugLoading && rugData && (
+              <div style={{ background:'#020509', border:'1px solid rgba(255,107,53,0.15)',
+                borderRadius:5, padding:10 }}>
+                <div style={{ color:'#ff6b35', fontSize:9, letterSpacing:1.5, marginBottom:8 }}>
+                  🛡️ RUG ANALYSIS
+                </div>
+                <div style={{ display:'grid', gridTemplateColumns:'repeat(4,1fr)', gap:6, marginBottom:8 }}>
+                  {/* Rug score */}
+                  <div style={statItem}>
+                    <div style={{ color:'#2a5a6a', fontSize:8, letterSpacing:1 }}>RUG SCORE</div>
+                    <div style={{ color: rugData.rug_score>=70?'#00ff88':rugData.rug_score>=40?'#ffd700':'#ff4466',
+                      fontWeight:'bold', marginTop:2, fontSize:13 }}>
+                      {rugData.rug_score}<span style={{ fontSize:9, color:'#4a7a8a' }}>/100</span>
+                    </div>
+                  </div>
+                  {/* LP Lock */}
+                  <div style={statItem}>
+                    <div style={{ color:'#2a5a6a', fontSize:8, letterSpacing:1 }}>LP LOCKED</div>
+                    <div style={{ color: (rugData.lp_locked_pct||0)>=80?'#00ff88':(rugData.lp_locked_pct||0)>=40?'#ffd700':'#ff4466',
+                      marginTop:2, fontSize:11 }}>
+                      {rugData.lp_locked_pct != null ? `${rugData.lp_locked_pct.toFixed(0)}%` : 'N/A'}
+                    </div>
+                  </div>
+                  {/* Mint */}
+                  <div style={statItem}>
+                    <div style={{ color:'#2a5a6a', fontSize:8, letterSpacing:1 }}>MINT AUTH</div>
+                    <div style={{ color: rugData.mint_disabled?'#00ff88':'#ff6b35', marginTop:2, fontSize:10 }}>
+                      {rugData.mint_disabled == null ? 'N/A' : rugData.mint_disabled ? '🔒 REVOKED' : '⚠ ACTIVE'}
+                    </div>
+                  </div>
+                  {/* Top-10 */}
+                  <div style={statItem}>
+                    <div style={{ color:'#2a5a6a', fontSize:8, letterSpacing:1 }}>TOP-10 HOLD</div>
+                    <div style={{ color: (rugData.top10_pct||0)<30?'#00ff88':(rugData.top10_pct||0)<60?'#ffd700':'#ff4466',
+                      marginTop:2, fontSize:11 }}>
+                      {rugData.top10_pct != null ? `${rugData.top10_pct.toFixed(1)}%` : 'N/A'}
+                    </div>
+                  </div>
+                </div>
+                {/* Boost / social */}
+                {rugData.boost_amount != null && (
+                  <div style={{ marginBottom:6 }}>
+                    <span style={{ color:'#2a5a6a', fontSize:8, letterSpacing:1 }}>DEXSCREENER BOOST  </span>
+                    <span style={{ color:'#c084fc', fontSize:10 }}>{rugData.boost_amount.toLocaleString()} pts</span>
+                  </div>
+                )}
+                {/* Risk flags */}
+                {rugData.rug_flags && rugData.rug_flags.length > 0 && (
+                  <div style={{ display:'flex', flexWrap:'wrap', gap:4 }}>
+                    {rugData.rug_flags.map((f, i) => (
+                      <span key={i} style={{ background:'rgba(255,68,102,0.10)',
+                        border:'1px solid rgba(255,68,102,0.3)', color:'#ff4466',
+                        padding:'2px 7px', borderRadius:3, fontSize:9 }}>
+                        ⚠ {f}
+                      </span>
+                    ))}
+                  </div>
+                )}
+                {rugData.rug_flags && rugData.rug_flags.length === 0 && (
+                  <div style={{ color:'#00ff88', fontSize:9 }}>✅ No risk flags detected</div>
+                )}
+              </div>
+            )}
           </div>
 
           {/* TP Ladder info */}
@@ -481,7 +600,7 @@ export function Scanner({ onAlert, portfolio }) {
 
 // ── Styles ────────────────────────────────────────────────────────────────────
 
-const TBL_COLS = '90px 55px 90px 60px 60px 75px 60px 50px 65px'
+const TBL_COLS = '100px 50px 72px 85px 55px 55px 70px 50px 62px'
 
 const card = {
   background: '#050d14', border: '1px solid rgba(0,220,180,0.1)',
@@ -537,4 +656,21 @@ const closeBtn = {
   background:'transparent', border:'1px solid rgba(255,68,102,0.3)', color:'#ff4466',
   padding:'4px 10px', borderRadius:3, cursor:'pointer', fontSize:11,
   fontFamily:"'IBM Plex Mono',monospace",
+}
+
+const PHASE_COLORS = {
+  STEALTH:      '#4a7a8a',
+  AWARENESS:    '#a0c4ff',
+  MANIA:        '#ffd700',
+  DISTRIBUTION: '#ff6b35',
+  DUMP:         '#ff4466',
+}
+const phaseTag = (phase) => {
+  const c = PHASE_COLORS[phase] || '#4a7a8a'
+  return {
+    background: `${c}18`, border: `1px solid ${c}55`,
+    color: c, padding: '1px 5px', borderRadius: 3,
+    fontSize: 8, letterSpacing: 0.8, fontWeight: 'bold',
+    whiteSpace: 'nowrap',
+  }
 }

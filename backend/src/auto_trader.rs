@@ -100,6 +100,29 @@ async fn try_buy(state: &Arc<AppState>) -> anyhow::Result<()> {
         }
     };
 
+    // ── Safety gate ────────────────────────────────────────────────────────────
+    if token.phase == "DUMP" || token.phase == "DISTRIBUTION" {
+        info!("⏭️  {} skipped — market phase: {}", token.symbol, token.phase);
+        return Ok(());
+    }
+    if state.config.min_rug_score > 0 {
+        match token.rug_score {
+            None => {
+                info!("⏭️  {} skipped — awaiting rug check", token.symbol);
+                return Ok(());
+            }
+            Some(s) if s < state.config.min_rug_score => {
+                info!("⏭️  {} skipped — rug score {}/100 below minimum {}", token.symbol, s, state.config.min_rug_score);
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
+    if token.top10_pct.map(|p| p > 70.0).unwrap_or(false) {
+        info!("⏭️  {} skipped — top-10 concentration {:.0}%", token.symbol, token.top10_pct.unwrap_or(0.0));
+        return Ok(());
+    }
+
     let quantity        = allocation / token.price_usd;
     let stop_loss_price = token.price_usd * (1.0 - state.config.stop_loss_pct);
     let pos_id          = uuid::Uuid::new_v4().to_string();

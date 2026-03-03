@@ -15,6 +15,7 @@ pub struct AppConfig {
     pub auto_buy_min_score: u8,
     pub auto_buy_interval_secs: u64,
     pub auto_buy_max_per_trade: f64,
+    pub min_rug_score: u8,           // 0 = bypass rug gate; >0 = require Rugcheck score ≥ this
 }
 
 impl AppConfig {
@@ -30,6 +31,7 @@ impl AppConfig {
             auto_buy_min_score: std::env::var("AUTO_BUY_MIN_SCORE").unwrap_or_else(|_| "60".into()).parse()?,
             auto_buy_interval_secs: std::env::var("AUTO_BUY_INTERVAL_SECS").unwrap_or_else(|_| "30".into()).parse()?,
             auto_buy_max_per_trade: std::env::var("AUTO_BUY_MAX_PER_TRADE").unwrap_or_else(|_| "0.15".into()).parse()?,
+            min_rug_score: std::env::var("MIN_RUG_SCORE").unwrap_or_else(|_| "0".into()).parse()?,
         })
     }
 }
@@ -96,6 +98,8 @@ pub struct Portfolio {
 
 // ── Scanner token (shared between scanner + state) ────────────────────────────
 
+fn default_phase() -> String { "STEALTH".into() }
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DexToken {
     pub pair_address: String,
@@ -113,6 +117,21 @@ pub struct DexToken {
     pub score: u8,
     pub risk_level: String,
     pub dex_url: String,
+    // ── Market intelligence (phase + rug enrichment) ──────────────────────────
+    #[serde(default = "default_phase")]
+    pub phase: String,               // STEALTH | AWARENESS | MANIA | DISTRIBUTION | DUMP
+    #[serde(default)]
+    pub rug_score: Option<u8>,       // 0-100 (Rugcheck), higher = safer
+    #[serde(default)]
+    pub lp_locked_pct: Option<f64>,  // % of LP tokens locked
+    #[serde(default)]
+    pub mint_disabled: Option<bool>, // mint authority revoked
+    #[serde(default)]
+    pub top10_pct: Option<f64>,      // % held by top-10 wallets
+    #[serde(default)]
+    pub rug_flags: Vec<String>,      // risk flags from Rugcheck
+    #[serde(default)]
+    pub boost_amount: Option<f64>,   // DexScreener boost (social-attention proxy)
 }
 
 // ── WebSocket message types ───────────────────────────────────────────────────

@@ -1,8 +1,9 @@
 use std::sync::Arc;
+use std::time::Duration;
 use axum::{
     Router,
     routing::get,
-    extract::{ws::{WebSocketUpgrade, WebSocket, Message}, State},
+    extract::{ws::{WebSocketUpgrade, WebSocket, Message}, Path, State},
     response::IntoResponse,
     Json,
 };
@@ -27,6 +28,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/config",      get(config_handler))
         .route("/api/scan-filter",  get(scan_filter_get).post(scan_filter_post))
         .route("/api/scan-queries", get(scan_queries_get).post(scan_queries_post))
+        .route("/api/rug/:mint",    get(rug_handler))
 
         .layer(cors)
         .with_state(state)
@@ -109,6 +111,80 @@ async fn scan_queries_post(
         }
     }
     Json(json!({ "ok": true }))
+}
+
+// ── Rug check — on-demand fetch with cache ────────────────────────────────────
+
+async fn rug_handler(
+    State(state): State<Arc<AppState>>,
+    Path(mint): Path<String>,
+) -> Json<serde_json::Value> {
+    // Return cached data if the token was already enriched by rug_checker
+    let cached = {
+        let tokens = state.scanner_tokens.read();
+        tokens.iter()
+            .find(|t| t.mint_address == mint)
+            .filter(|t| t.rug_score.is_some())
+            .map(|t| json!({
+                "rug_score":    t.rug_score,
+                "lp_locked_pct": t.lp_locked_pct,
+                "mint_disabled": t.mint_disabled,
+                "top10_pct":    t.top10_pct,
+                "rug_flags":    &t.rug_flags,
+                "boost_amount": t.boost_amount,
+                "phase":        &t.phase,
+                "cached":       true,
+            }))
+    };
+    if let Some(data) = cached {
+        return Json(json!({ "data": data }));
+    }
+
+    // Fetch fresh from Rugcheck API
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(12))
+        .user_agent("sodagar-sniper/1.0")
+        .build()
+        .unwrap_or_default();
+    let url = format!("https://api.rugcheck.xyz/v1/tokens/{}/report", mint);
+
+    let resp = match client.get(&url).send().await {
+        Err(e)  => return Json(json!({ "error": e.to_string() })),
+        Ok(r)   => r,
+    };
+    if !resp.status().is_success() {
+        return Json(json!({ "error": format!("Rugcheck HTTP {}", resp.status()) }));
+    }
+    let report = match resp.json::<crate::rug_checker::RugReport>().await {
+        Err(e)  => return Json(json!({ "error": e.to_string() })),
+        Ok(r)   => r,
+    };
+
+    let (rug_score, lp_locked_pct, mint_disabled, top10_pct, rug_flags) =
+        crate::rug_checker::extract_rug_data(report);
+
+    // Update cache in scanner_tokens if the token is already in the pool
+    {
+        let mut tokens = state.scanner_tokens.write();
+        if let Some(t) = tokens.iter_mut().find(|t| t.mint_address == mint) {
+            t.rug_score     = Some(rug_score);
+            t.lp_locked_pct = lp_locked_pct;
+            t.mint_disabled = mint_disabled;
+            t.top10_pct     = top10_pct;
+            t.rug_flags     = rug_flags.clone();
+        }
+    }
+
+    Json(json!({
+        "data": {
+            "rug_score":    rug_score,
+            "lp_locked_pct": lp_locked_pct,
+            "mint_disabled": mint_disabled,
+            "top10_pct":    top10_pct,
+            "rug_flags":    rug_flags,
+            "cached":       false,
+        }
+    }))
 }
 
 // ── WebSocket ─────────────────────────────────────────────────────────────────
